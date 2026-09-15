@@ -1,0 +1,18 @@
+# Local settings (paths, cookie location) - never commit; see config.example.json
+config.json
+
+# Downloaded media and job bookkeeping
+downloads/
+.jobs/
+
+# Cookie exports contain live session tokens
+*cookies*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini

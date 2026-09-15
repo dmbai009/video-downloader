@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16181d">
+<title>Video Downloader</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --panel-2: #eef0f4;
+    --line: #d9dce3;
+    --text: #1a1d23;
+    --muted: #666d7a;
+    --accent: #2f6df5;
+    --accent-text: #ffffff;
+    --ok: #1f9254;
+    --warn: #b7791f;
+    --err: #c0392b;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216;
+      --panel: #181b21;
+      --panel-2: #1f232b;
+      --line: #2c313b;
+      --text: #e7e9ee;
+      --muted: #8d95a3;
+      --accent: #5b8cff;
+      --accent-text: #0b1020;
+      --ok: #3ecf8e;
+      --warn: #e0b341;
+      --err: #ff6b6b;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+
+  header { margin-bottom: 18px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 14px;
+  }
+
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+
+  input[type=text], select {
+    width: 100%;
+    padding: 11px 12px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    font-size: 15px;
+    font-family: inherit;
+  }
+  input[type=text]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 160px; min-width: 0; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+
+  button {
+    padding: 11px 18px;
+    border-radius: 9px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.small { padding: 6px 12px; font-size: 13px; }
+  button.danger { color: var(--err); }
+
+  .presets { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .preset { flex: 1 1 150px; text-align: left; line-height: 1.3; }
+  .preset.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel-2)); }
+  .preset b { display: block; font-size: 14px; }
+  .preset span { font-size: 11px; color: var(--muted); }
+
+  .info { display: flex; gap: 14px; align-items: flex-start; }
+  .info img { width: 140px; border-radius: 8px; flex-shrink: 0; background: var(--panel-2); }
+  .info h2 { font-size: 16px; margin: 0 0 6px; word-break: break-word; }
+  @media (max-width: 520px) {
+    .info { flex-direction: column; }
+    .info img { width: 100%; }
+  }
+
+  .chip {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--muted);
+    margin: 0 4px 4px 0;
+  }
+  .chip.ok { color: var(--ok); border-color: currentColor; }
+  .chip.warn { color: var(--warn); border-color: currentColor; }
+
+  .job, .file { padding: 11px 0; border-bottom: 1px solid var(--line); }
+  .job:last-child, .file:last-child { border-bottom: 0; }
+  .job-top, .file-top {
+    display: flex; gap: 10px; align-items: baseline; justify-content: space-between;
+  }
+  .name { word-break: break-word; font-size: 14px; flex: 1; }
+  .meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+  .bar { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin-top: 7px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); transition: width .25s; }
+  .bar.done > i { background: var(--ok); }
+  .bar.err > i { background: var(--err); }
+
+  .err-text { color: var(--err); font-size: 12px; margin-top: 5px; word-break: break-word; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .warnbox {
+    margin-top: 10px; padding: 9px 11px; border-radius: 8px; font-size: 12px;
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    color: var(--text);
+  }
+
+  details { margin-top: 12px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  .tablewrap { overflow-x: auto; }
+  td button { padding: 3px 9px; font-size: 11px; }
+
+  .checks { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
+  .checks label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); margin: 0; }
+
+  a { color: var(--accent); }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .spin { display: inline-block; animation: sp 1s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Video Downloader</h1>
+    <div class="sub">YouTube and Niconico &middot; pick quality, codec and container</div>
+  </header>
+
+  <div class="card">
+    <label for="url">Video link</label>
+    <div class="row">
+      <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=… or https://www.nicovideo.jp/watch/sm…"
+             style="flex: 3 1 260px" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="primary" id="probeBtn" style="flex: 0 0 auto">Check</button>
+    </div>
+    <div id="probeErr" class="err-text" hidden></div>
+  </div>
+
+  <div class="card" id="infoCard" hidden>
+    <div class="info">
+      <img id="thumb" alt="" hidden>
+      <div style="flex:1; min-width:0">
+        <h2 id="title"></h2>
+        <div id="chips"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="presets">
+      <button class="preset active" data-preset="edit">
+        <b>For editing</b><span>H.264 + AAC, mp4 — every editor reads it</span>
+      </button>
+      <button class="preset" data-preset="max">
+        <b>Best quality</b><span>any codec, mkv — for watching</span>
+      </button>
+      <button class="preset" data-preset="audio">
+        <b>Audio only</b><span>m4a / mp3, no video</span>
+      </button>
+    </div>
+
+    <div class="grid" id="videoOpts">
+      <div>
+        <label for="height">Quality</label>
+        <select id="height"><option value="best">Best available</option></select>
+      </div>
+      <div>
+        <label for="vcodec">Video codec</label>
+        <select id="vcodec">
+          <option value="any">Any</option>
+          <option value="h264">H.264 (avc1)</option>
+          <option value="vp9">VP9</option>
+          <option value="av1">AV1</option>
+        </select>
+      </div>
+      <div>
+        <label for="acodec">Audio codec</label>
+        <select id="acodec">
+          <option value="any">Any</option>
+          <option value="aac">AAC</option>
+          <option value="opus">Opus</option>
+        </select>
+      </div>
+      <div>
+        <label for="container">Container</label>
+        <select id="container">
+          <option value="mp4">MP4</option>
+          <option value="mkv">MKV</option>
+          <option value="webm">WebM</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="grid" id="audioOpts" hidden>
+      <div>
+        <label for="audioFormat">Audio format</label>
+        <select id="audioFormat">
+          <option value="m4a">M4A (AAC)</option>
+          <option value="mp3">MP3</option>
+          <option value="opus">Opus</option>
+          <option value="wav">WAV</option>
+          <option value="flac">FLAC</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="codecWarn" class="warnbox" hidden></div>
+
+    <div class="checks">
+      <label><input type="checkbox" id="optMeta" checked> Metadata</label>
+      <label><input type="checkbox" id="optThumb"> Thumbnail file</label>
+      <label><input type="checkbox" id="optSubs"> Subtitles</label>
+    </div>
+
+    <details id="expert">
+      <summary>Pick an exact format</summary>
+      <div class="tablewrap"><table id="fmtTable"><tbody></tbody></table></div>
+      <div class="hint" id="fmtPicked" hidden></div>
+    </details>
+
+    <div style="margin-top:16px">
+      <button class="primary" id="dlBtn" style="width:100%">Download</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="file-top" style="margin-bottom:6px">
+      <b style="font-size:14px">Downloads</b>
+      <button class="small" id="clearJobs">Clear list</button>
+    </div>
+    <div id="jobs"><div class="empty">Nothing downloaded yet.</div></div>
+  </div>
+
+  <div class="card">
+    <div class="file-top" style="margin-bottom:6px">
+      <b style="font-size:14px">Finished files</b>
+      <span class="meta" id="dlDir"></span>
+    </div>
+    <div id="files"><div class="empty">Folder is empty.</div></div>
+    <div class="hint">On a phone, tap a file name to save it to the device.</div>
+  </div>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let probed = null;
+let pickedFormat = "";
+let preset = "edit";
+
+// ---------------------------------------------------------------- helpers
+
+function human(bytes) {
+  if (!bytes && bytes !== 0) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let n = bytes, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + units[i];
+}
+
+function clock(sec) {
+  if (sec === null || sec === undefined || isNaN(sec)) return "";
+  sec = Math.round(sec);
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ":" + String(s).padStart(2, "0");
+}
+
+async function api(path, body) {
+  const opts = body
+    ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    : {};
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({ error: "server did not return JSON" }));
+  if (!res.ok) throw new Error(data.error || ("error " + res.status));
+  return data;
+}
+
+// ---------------------------------------------------------------- presets
+
+const PRESETS = {
+  edit:  { mode: "video", vcodec: "h264", acodec: "aac", container: "mp4" },
+  max:   { mode: "video", vcodec: "any",  acodec: "any", container: "mkv" },
+  audio: { mode: "audio" },
+};
+
+function applyPreset(name) {
+  preset = name;
+  document.querySelectorAll(".preset").forEach(b =>
+    b.classList.toggle("active", b.dataset.preset === name));
+
+  const isAudio = name === "audio";
+  $("videoOpts").hidden = isAudio;
+  $("audioOpts").hidden = !isAudio;
+
+  const p = PRESETS[name];
+  if (!isAudio) {
+    $("vcodec").value = p.vcodec;
+    $("acodec").value = p.acodec;
+    $("container").value = p.container;
+  }
+  checkCombo();
+}
+
+document.querySelectorAll(".preset").forEach(btn =>
+  btn.addEventListener("click", () => applyPreset(btn.dataset.preset)));
+
+// The main trap: Opus inside MP4 is a valid file that players accept, but most
+// video editors cannot decode it and import the clip with no sound at all.
+function checkCombo() {
+  const box = $("codecWarn");
+  if (preset === "audio") { box.hidden = true; return; }
+
+  const container = $("container").value;
+  const acodec = $("acodec").value;
+  const vcodec = $("vcodec").value;
+  const notes = [];
+
+  if (container === "mp4" && acodec === "opus")
+    notes.push("Opus in MP4 will not open in most video editors — the clip imports without sound. Pick AAC, or switch the container to MKV.");
+  if (container === "mp4" && acodec === "any")
+    notes.push("With “any” audio codec YouTube usually serves Opus, which may stay silent in an editor. AAC is the safe choice for editing.");
+  if (container === "mp4" && (vcodec === "vp9" || vcodec === "av1"))
+    notes.push("VP9/AV1 inside MP4 is an unusual combination; if your player or editor refuses it, use MKV or H.264.");
+  if (container === "webm" && (acodec === "aac" || vcodec === "h264"))
+    notes.push("WebM cannot hold H.264/AAC, so yt-dlp will either re-encode or fall back to different tracks.");
+
+  box.hidden = notes.length === 0;
+  box.textContent = notes.join(" ");
+}
+
+["container", "acodec", "vcodec"].forEach(id =>
+  $(id).addEventListener("change", checkCombo));
+
+// ---------------------------------------------------------------- probing
+
+$("probeBtn").addEventListener("click", doProbe);
+$("url").addEventListener("keydown", e => { if (e.key === "Enter") doProbe(); });
+
+async function doProbe() {
+  const url = $("url").value.trim();
+  if (!url) return;
+
+  const btn = $("probeBtn");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin">◐</span>';
+  $("probeErr").hidden = true;
+
+  try {
+    probed = await api("/api/probe", { url });
+    renderInfo(probed);
+  } catch (e) {
+    probed = null;
+    $("infoCard").hidden = true;
+    $("probeErr").hidden = false;
+    $("probeErr").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Check";
+  }
+}
+
+function renderInfo(info) {
+  $("infoCard").hidden = false;
+  $("title").textContent = info.title || "(untitled)";
+
+  const chips = [];
+  if (info.extractor) chips.push(info.extractor);
+  if (info.uploader) chips.push(info.uploader);
+  if (info.duration) chips.push(clock(info.duration));
+  if (info.heights.length) chips.push("up to " + info.heights[0] + "p");
+  if (info.vcodecs.length) chips.push("video: " + info.vcodecs.join(", "));
+  if (info.acodecs.length) chips.push("audio: " + info.acodecs.join(", "));
+
+  const chipBox = $("chips");
+  chipBox.innerHTML = "";
+  chips.forEach(text => {
+    const el = document.createElement("span");
+    el.className = "chip";
+    el.textContent = text;
+    chipBox.appendChild(el);
+  });
+
+  const img = $("thumb");
+  img.hidden = !info.thumbnail;
+  if (info.thumbnail) img.src = info.thumbnail;
+
+  // Offer only the resolutions this video actually has.
+  const sel = $("height");
+  sel.innerHTML = '<option value="best">Best available</option>';
+  info.heights.forEach(h => {
+    const option = document.createElement("option");
+    option.value = h;
+    option.textContent = h + "p";
+    sel.appendChild(option);
+  });
+
+  pickedFormat = "";
+  $("fmtPicked").hidden = true;
+
+  const tbody = $("fmtTable").querySelector("tbody");
+  tbody.innerHTML = "";
+  const head = document.createElement("tr");
+  head.innerHTML = "<th>ID</th><th>Kind</th><th>Codec</th><th>Size</th><th></th>";
+  tbody.appendChild(head);
+
+  info.formats.slice().reverse().forEach(f => {
+    const tr = document.createElement("tr");
+    const kind = f.height ? f.height + "p" + (f.fps ? " " + Math.round(f.fps) : "") : "audio";
+    const codec = [f.vcodec, f.acodec].filter(Boolean).join(" + ") || "—";
+
+    [f.format_id, kind, codec, f.filesize ? human(f.filesize) : ""].forEach(text => {
+      const td = document.createElement("td");
+      td.textContent = text;
+      tr.appendChild(td);
+    });
+
+    const td = document.createElement("td");
+    const pick = document.createElement("button");
+    pick.className = "small";
+    pick.textContent = "use";
+    pick.addEventListener("click", () => {
+      pickedFormat = pickedFormat === f.format_id ? "" : f.format_id;
+      $("fmtPicked").hidden = !pickedFormat;
+      $("fmtPicked").textContent = pickedFormat
+        ? "Format " + pickedFormat + " selected — the options above are ignored. Click again to clear."
+        : "";
+    });
+    td.appendChild(pick);
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  });
+}
+
+// ---------------------------------------------------------------- downloading
+
+$("dlBtn").addEventListener("click", async () => {
+  const url = $("url").value.trim();
+  if (!url) { $("url").focus(); return; }
+
+  const body = {
+    url,
+    title: probed ? probed.title : url,
+    mode: preset === "audio" ? "audio" : "video",
+    height: $("height").value,
+    vcodec: $("vcodec").value,
+    acodec: $("acodec").value,
+    container: $("container").value,
+    audio_format: $("audioFormat").value,
+    format_id: pickedFormat,
+    metadata: $("optMeta").checked,
+    thumbnail: $("optThumb").checked,
+    subtitles: $("optSubs").checked,
+  };
+
+  const btn = $("dlBtn");
+  btn.disabled = true;
+  try {
+    await api("/api/download", body);
+    await refresh();
+  } catch (e) {
+    $("probeErr").hidden = false;
+    $("probeErr").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("clearJobs").addEventListener("click", async () => {
+  await api("/api/forget", {});
+  refresh();
+});
+
+// ---------------------------------------------------------------- rendering
+
+function renderJobs(jobs) {
+  const box = $("jobs");
+  if (!jobs.length) {
+    box.innerHTML = '<div class="empty">Nothing downloaded yet.</div>';
+    return;
+  }
+  box.innerHTML = "";
+
+  jobs.forEach(j => {
+    const div = document.createElement("div");
+    div.className = "job";
+
+    let right;
+    if (j.status === "running") {
+      const speed = j.speed ? human(j.speed) + "/s" : "";
+      const eta = j.eta ? " · " + clock(j.eta) + " left" : "";
+      right = (j.percent || 0) + "% · " + speed + eta;
+    } else {
+      right = { done: "done", error: "failed", canceled: "canceled" }[j.status] || j.status;
+    }
+
+    const top = document.createElement("div");
+    top.className = "job-top";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = j.file || j.title;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = right;
+    top.append(name, meta);
+    div.appendChild(top);
+
+    const stage = document.createElement("div");
+    stage.className = "meta";
+    stage.textContent = j.stage || "";
+    div.appendChild(stage);
+
+    const bar = document.createElement("div");
+    bar.className = "bar" + (j.status === "done" ? " done" : j.status === "error" ? " err" : "");
+    const fill = document.createElement("i");
+    fill.style.width = (j.status === "done" ? 100 : (j.percent || 0)) + "%";
+    bar.appendChild(fill);
+    div.appendChild(bar);
+
+    if (j.error) {
+      const err = document.createElement("div");
+      err.className = "err-text";
+      err.textContent = j.error;
+      div.appendChild(err);
+    }
+
+    if (j.status === "running") {
+      const cancel = document.createElement("button");
+      cancel.className = "small danger";
+      cancel.style.marginTop = "8px";
+      cancel.textContent = "Cancel";
+      cancel.onclick = async () => { await api("/api/cancel", { id: j.id }); refresh(); };
+      div.appendChild(cancel);
+    }
+
+    box.appendChild(div);
+  });
+}
+
+function renderFiles(files) {
+  const box = $("files");
+  if (!files.length) {
+    box.innerHTML = '<div class="empty">Folder is empty.</div>';
+    return;
+  }
+  box.innerHTML = "";
+
+  files.forEach(f => {
+    const div = document.createElement("div");
+    div.className = "file";
+
+    const top = document.createElement("div");
+    top.className = "file-top";
+
+    const link = document.createElement("a");
+    link.className = "name";
+    link.href = "/dl/" + encodeURIComponent(f.name);
+    link.textContent = f.name;
+    link.setAttribute("download", f.name);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = human(f.size);
+
+    top.append(link, meta);
+    div.appendChild(top);
+
+    if (f.codecs && (f.codecs.video || f.codecs.audio)) {
+      const chips = document.createElement("div");
+      chips.style.marginTop = "5px";
+      const silentInEditor = f.name.toLowerCase().endsWith(".mp4") && f.codecs.audio === "opus";
+
+      const addChip = (text, cls) => {
+        const chip = document.createElement("span");
+        chip.className = "chip" + (cls ? " " + cls : "");
+        chip.textContent = text;
+        chips.appendChild(chip);
+      };
+
+      if (f.codecs.video) addChip(f.codecs.video);
+      if (f.codecs.audio) addChip(f.codecs.audio, silentInEditor ? "warn" : "ok");
+      else addChip("no audio", "warn");
+      if (silentInEditor) addChip("editors will hear nothing", "warn");
+
+      div.appendChild(chips);
+    }
+
+    box.appendChild(div);
+  });
+}
+
+async function refresh() {
+  try {
+    const state = await api("/api/state");
+    renderJobs(state.jobs);
+    renderFiles(state.files);
+  } catch (e) {
+    // Server stopped or restarting; just wait for the next tick.
+  }
+}
+
+async function loadConfig() {
+  try {
+    const cfg = await api("/api/config");
+    $("dlDir").textContent = cfg.download_dir + (cfg.cookies ? "" : " · no cookies");
+  } catch (e) {
+    // Not critical: the page works without this label.
+  }
+}
+
+applyPreset("edit");
+loadConfig();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
