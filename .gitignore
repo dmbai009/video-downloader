@@ -16,3 +16,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Crash dumps from git bash on Windows
+*.stackdump

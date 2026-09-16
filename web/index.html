@@ -126,7 +126,7 @@
 
   .job, .file { padding: 11px 0; border-bottom: 1px solid var(--line); }
   .job:last-child, .file:last-child { border-bottom: 0; }
-  .job-top, .file-top {
+  .job-top {
     display: flex; gap: 10px; align-items: baseline; justify-content: space-between;
   }
   .name { word-break: break-word; font-size: 14px; flex: 1; }
@@ -136,6 +136,19 @@
   .bar > i { display: block; height: 100%; background: var(--accent); transition: width .25s; }
   .bar.done > i { background: var(--ok); }
   .bar.err > i { background: var(--err); }
+
+  .player {
+    display: block; width: 100%; margin-top: 10px;
+    border-radius: 8px; background: #000; max-height: 60vh;
+  }
+  audio.player { background: transparent; max-height: none; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 9px; }
+  a.btnlink {
+    display: inline-block; padding: 6px 12px; font-size: 13px;
+    background: var(--panel-2); color: var(--text); text-decoration: none;
+    border: 1px solid var(--line); border-radius: 9px;
+  }
+  a.btnlink:hover { border-color: var(--accent); }
 
   .err-text { color: var(--err); font-size: 12px; margin-top: 5px; word-break: break-word; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -169,6 +182,7 @@
   <header>
     <h1>Video Downloader</h1>
     <div class="sub">YouTube and Niconico &middot; pick quality, codec and container</div>
+    <div class="sub" id="dlDir"></div>
   </header>
 
   <div class="card">
@@ -269,20 +283,11 @@
   </div>
 
   <div class="card">
-    <div class="file-top" style="margin-bottom:6px">
+    <div class="job-top" style="margin-bottom:6px">
       <b style="font-size:14px">Downloads</b>
       <button class="small" id="clearJobs">Clear list</button>
     </div>
     <div id="jobs"><div class="empty">Nothing downloaded yet.</div></div>
-  </div>
-
-  <div class="card">
-    <div class="file-top" style="margin-bottom:6px">
-      <b style="font-size:14px">Finished files</b>
-      <span class="meta" id="dlDir"></span>
-    </div>
-    <div id="files"><div class="empty">Folder is empty.</div></div>
-    <div class="hint">On a phone, tap a file name to save it to the device.</div>
   </div>
 
 </div>
@@ -517,119 +522,162 @@ $("clearJobs").addEventListener("click", async () => {
 
 // ---------------------------------------------------------------- rendering
 
+// Nodes are kept per job id and updated in place. Rebuilding the list on every
+// poll would restart the <video> element once a second.
+const jobNodes = new Map();
+
+function jobNode(id) {
+  let node = jobNodes.get(id);
+  if (node) return node;
+
+  const root = document.createElement("div");
+  root.className = "job";
+
+  const top = document.createElement("div");
+  top.className = "job-top";
+  const name = document.createElement("div");
+  name.className = "name";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  top.append(name, meta);
+
+  const stage = document.createElement("div");
+  stage.className = "meta";
+
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  const fill = document.createElement("i");
+  bar.appendChild(fill);
+
+  const extra = document.createElement("div");   // cancel button, or the result block
+
+  root.append(top, stage, bar, extra);
+  node = { root, name, meta, stage, bar, fill, extra, shown: null };
+  jobNodes.set(id, node);
+  return node;
+}
+
+function addChip(box, text, cls) {
+  const chip = document.createElement("span");
+  chip.className = "chip" + (cls ? " " + cls : "");
+  chip.textContent = text;
+  box.appendChild(chip);
+}
+
+function resultBlock(j) {
+  const frag = document.createDocumentFragment();
+  const file = j.file || "";
+  const silentInEditor = file.toLowerCase().endsWith(".mp4") && j.codecs && j.codecs.audio === "opus";
+
+  const chips = document.createElement("div");
+  chips.style.marginTop = "6px";
+  if (j.codecs && j.codecs.video) addChip(chips, j.codecs.video);
+  if (j.codecs && j.codecs.audio) addChip(chips, j.codecs.audio, silentInEditor ? "warn" : "ok");
+  else if (j.kind !== "audio") addChip(chips, "no audio", "warn");
+  if (j.size) addChip(chips, human(j.size));
+  if (silentInEditor) addChip(chips, "editors will hear nothing", "warn");
+  if (chips.children.length) frag.appendChild(chips);
+
+  const player = document.createElement(j.kind === "audio" ? "audio" : "video");
+  player.className = "player";
+  player.controls = true;
+  player.preload = "metadata";
+  player.src = "/media/" + encodeURIComponent(file);
+
+  // MKV and exotic codec combinations cannot be played by browsers at all.
+  const note = document.createElement("div");
+  note.className = "hint";
+  note.hidden = true;
+  player.addEventListener("error", () => {
+    player.hidden = true;
+    note.hidden = false;
+    note.textContent = "This container cannot be previewed in a browser (MKV usually cannot). "
+                     + "The file is saved on the server either way.";
+  });
+  frag.append(player, note);
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+
+  const save = document.createElement("a");
+  save.className = "btnlink";
+  save.href = "/dl/" + encodeURIComponent(file);
+  save.setAttribute("download", file);
+  save.textContent = "Save to this device";
+
+  const hint = document.createElement("span");
+  hint.className = "meta";
+  hint.textContent = "already on the server — only needed from a phone or another computer";
+
+  actions.append(save, hint);
+  frag.appendChild(actions);
+  return frag;
+}
+
+function updateJob(node, j) {
+  node.name.textContent = j.file || j.title;
+  node.stage.textContent = j.stage || "";
+
+  if (j.status === "running") {
+    const speed = j.speed ? human(j.speed) + "/s" : "";
+    const eta = j.eta ? " · " + clock(j.eta) + " left" : "";
+    node.meta.textContent = (j.percent || 0) + "% · " + speed + eta;
+  } else {
+    node.meta.textContent = { done: "done", error: "failed", canceled: "canceled" }[j.status] || j.status;
+  }
+
+  node.bar.className = "bar" + (j.status === "done" ? " done" : j.status === "error" ? " err" : "");
+  node.fill.style.width = (j.status === "done" ? 100 : (j.percent || 0)) + "%";
+
+  // Only rebuild the lower half when the status actually changes, so a finished
+  // job's player is created exactly once.
+  if (node.shown === j.status) return;
+  node.shown = j.status;
+  node.extra.innerHTML = "";
+
+  if (j.status === "running") {
+    const cancel = document.createElement("button");
+    cancel.className = "small danger";
+    cancel.style.marginTop = "8px";
+    cancel.textContent = "Cancel";
+    cancel.onclick = async () => { await api("/api/cancel", { id: j.id }); refresh(); };
+    node.extra.appendChild(cancel);
+  } else if (j.status === "done" && j.file) {
+    node.extra.appendChild(resultBlock(j));
+  }
+
+  if (j.error) {
+    const err = document.createElement("div");
+    err.className = "err-text";
+    err.textContent = j.error;
+    node.extra.appendChild(err);
+  }
+}
+
 function renderJobs(jobs) {
   const box = $("jobs");
+
   if (!jobs.length) {
+    jobNodes.clear();
     box.innerHTML = '<div class="empty">Nothing downloaded yet.</div>';
     return;
   }
-  box.innerHTML = "";
 
-  jobs.forEach(j => {
-    const div = document.createElement("div");
-    div.className = "job";
-
-    let right;
-    if (j.status === "running") {
-      const speed = j.speed ? human(j.speed) + "/s" : "";
-      const eta = j.eta ? " · " + clock(j.eta) + " left" : "";
-      right = (j.percent || 0) + "% · " + speed + eta;
-    } else {
-      right = { done: "done", error: "failed", canceled: "canceled" }[j.status] || j.status;
+  const seen = new Set(jobs.map(j => j.id));
+  for (const id of [...jobNodes.keys()]) {
+    if (!seen.has(id)) {
+      jobNodes.get(id).root.remove();
+      jobNodes.delete(id);
     }
-
-    const top = document.createElement("div");
-    top.className = "job-top";
-    const name = document.createElement("div");
-    name.className = "name";
-    name.textContent = j.file || j.title;
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = right;
-    top.append(name, meta);
-    div.appendChild(top);
-
-    const stage = document.createElement("div");
-    stage.className = "meta";
-    stage.textContent = j.stage || "";
-    div.appendChild(stage);
-
-    const bar = document.createElement("div");
-    bar.className = "bar" + (j.status === "done" ? " done" : j.status === "error" ? " err" : "");
-    const fill = document.createElement("i");
-    fill.style.width = (j.status === "done" ? 100 : (j.percent || 0)) + "%";
-    bar.appendChild(fill);
-    div.appendChild(bar);
-
-    if (j.error) {
-      const err = document.createElement("div");
-      err.className = "err-text";
-      err.textContent = j.error;
-      div.appendChild(err);
-    }
-
-    if (j.status === "running") {
-      const cancel = document.createElement("button");
-      cancel.className = "small danger";
-      cancel.style.marginTop = "8px";
-      cancel.textContent = "Cancel";
-      cancel.onclick = async () => { await api("/api/cancel", { id: j.id }); refresh(); };
-      div.appendChild(cancel);
-    }
-
-    box.appendChild(div);
-  });
-}
-
-function renderFiles(files) {
-  const box = $("files");
-  if (!files.length) {
-    box.innerHTML = '<div class="empty">Folder is empty.</div>';
-    return;
   }
-  box.innerHTML = "";
 
-  files.forEach(f => {
-    const div = document.createElement("div");
-    div.className = "file";
+  const placeholder = box.querySelector(".empty");
+  if (placeholder) placeholder.remove();
 
-    const top = document.createElement("div");
-    top.className = "file-top";
-
-    const link = document.createElement("a");
-    link.className = "name";
-    link.href = "/dl/" + encodeURIComponent(f.name);
-    link.textContent = f.name;
-    link.setAttribute("download", f.name);
-
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = human(f.size);
-
-    top.append(link, meta);
-    div.appendChild(top);
-
-    if (f.codecs && (f.codecs.video || f.codecs.audio)) {
-      const chips = document.createElement("div");
-      chips.style.marginTop = "5px";
-      const silentInEditor = f.name.toLowerCase().endsWith(".mp4") && f.codecs.audio === "opus";
-
-      const addChip = (text, cls) => {
-        const chip = document.createElement("span");
-        chip.className = "chip" + (cls ? " " + cls : "");
-        chip.textContent = text;
-        chips.appendChild(chip);
-      };
-
-      if (f.codecs.video) addChip(f.codecs.video);
-      if (f.codecs.audio) addChip(f.codecs.audio, silentInEditor ? "warn" : "ok");
-      else addChip("no audio", "warn");
-      if (silentInEditor) addChip("editors will hear nothing", "warn");
-
-      div.appendChild(chips);
-    }
-
-    box.appendChild(div);
+  jobs.forEach((j, index) => {
+    const node = jobNode(j.id);
+    updateJob(node, j);
+    if (box.children[index] !== node.root) box.insertBefore(node.root, box.children[index] || null);
   });
 }
 
@@ -637,7 +685,6 @@ async function refresh() {
   try {
     const state = await api("/api/state");
     renderJobs(state.jobs);
-    renderFiles(state.files);
   } catch (e) {
     // Server stopped or restarting; just wait for the next tick.
   }
@@ -646,7 +693,7 @@ async function refresh() {
 async function loadConfig() {
   try {
     const cfg = await api("/api/config");
-    $("dlDir").textContent = cfg.download_dir + (cfg.cookies ? "" : " · no cookies");
+    $("dlDir").textContent = "Saving to " + cfg.download_dir + (cfg.cookies ? "" : " · no cookies");
   } catch (e) {
     // Not critical: the page works without this label.
   }

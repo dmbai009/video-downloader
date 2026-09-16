@@ -57,11 +57,16 @@ Stop with `Ctrl+C`.
 2. Pick a preset, or set quality, video codec, audio codec and container by hand.
    The **Pick an exact format** section exposes every individual format ID if you
    want one specific stream.
-3. Press **Download**. Progress, speed and ETA appear below, and finished files are
-   listed with their real codecs.
+3. Press **Download**. Progress, speed and ETA appear below.
 
-Tapping a file name in **Finished files** saves it to the device you are browsing
-from — so you can download on the desktop and pull the file straight to a phone.
+That is the whole download. The file is written straight to `download_dir` on the
+machine running the server — nothing else is needed.
+
+When a job finishes it turns into a player right there on the page, with the file's
+real codecs and size next to it, so you can confirm what you got without opening the
+folder. **Save to this device** below the player is only for pulling the file onto a
+phone or another computer; on the machine that did the downloading it would just
+write a second copy.
 
 ## Presets
 
@@ -82,9 +87,9 @@ imports as picture with no sound at all.
 The preset forces the AAC track instead. No re-encoding happens either way, so
 quality is unchanged; only the track choice differs.
 
-The UI flags risky combinations before you download, and the finished-files list
-shows each file's real codecs via ffprobe. An amber `editors will hear nothing`
-badge marks exactly this situation.
+The UI flags risky combinations before you download, and every finished job shows
+its file's real codecs via ffprobe. An amber `editors will hear nothing` badge marks
+exactly this situation.
 
 ## Configuration — `config.json`
 
@@ -116,6 +121,9 @@ Cookies expire. When downloads start failing with a login error, export a fresh 
   page and download through it. Fine on a home network; set `127.0.0.1` on public Wi-Fi.
 - **Playlists are disabled** (`--no-playlist`): a link to a video inside a playlist
   downloads that one video, not the whole list.
+- **MKV does not preview.** Browsers cannot play the Matroska container, so the
+  "Best quality" preset shows a note instead of a player. The file itself is fine —
+  this only affects the preview.
 - **Keep yt-dlp current.** YouTube changes its player regularly and older versions
   break: `scoop update yt-dlp` / `brew upgrade yt-dlp` / `pipx upgrade yt-dlp`.
 - yt-dlp may warn about a missing JavaScript runtime. Installing Deno or Node 20+

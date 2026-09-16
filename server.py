@@ -42,6 +42,20 @@ DEFAULT_CONFIG = {
 }
 
 MEDIA_EXT = (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".opus", ".wav", ".flac")
+AUDIO_EXT = (".m4a", ".mp3", ".opus", ".wav", ".flac")
+
+# Content types for inline playback. Browsers refuse to play a file served as
+# application/octet-stream, so the extension has to be mapped explicitly.
+MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+}
 VCODEC_FILTER = {"h264": "[vcodec^=avc1]", "vp9": "[vcodec^=vp9]", "av1": "[vcodec^=av01]"}
 ACODEC_FILTER = {"aac": "[acodec^=mp4a]", "opus": "[acodec^=opus]"}
 
@@ -114,7 +128,6 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 PROBE_CACHE = {}
-CODEC_CACHE = {}
 
 
 # --------------------------------------------------------------------------- yt-dlp
@@ -376,7 +389,15 @@ def apply_progress(job, line):
 def finish(job, status, file=None, error=None):
     job.update(status=status, finished=time.time(), proc=None)
     if file:
-        job["file"] = os.path.basename(file)
+        path = Path(file)
+        suffix = path.suffix.lower()
+        job["file"] = path.name
+        job["kind"] = "audio" if suffix in AUDIO_EXT else "video"
+        job["codecs"] = file_codecs(path) if suffix in MEDIA_EXT else None
+        try:
+            job["size"] = path.stat().st_size
+        except OSError:
+            job["size"] = None
     if error:
         job["error"] = error
     job["stage"] = {
@@ -429,33 +450,6 @@ def file_codecs(path):
     return found
 
 
-def list_files():
-    """Newest files in the download folder, with codecs cached per (name, mtime, size)."""
-    items = []
-    try:
-        entries = sorted(DOWNLOAD_DIR.iterdir(),
-                         key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        return items
-
-    for path in entries:
-        if len(items) >= 60:
-            break
-        if not path.is_file() or path.suffix.lower() in (".part", ".ytdl"):
-            continue
-        stat = path.stat()
-        key = (path.name, stat.st_mtime, stat.st_size)
-        if key not in CODEC_CACHE:
-            CODEC_CACHE[key] = file_codecs(path) if path.suffix.lower() in MEDIA_EXT else None
-        items.append({
-            "name": path.name,
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-            "codecs": CODEC_CACHE[key],
-        })
-    return items
-
-
 def safe_path(name):
     """Resolve a requested filename, refusing anything outside the download folder."""
     candidate = (DOWNLOAD_DIR / os.path.basename(name)).resolve()
@@ -504,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
                 jobs = [{k: v for k, v in job.items() if k != "proc"}
                         for job in sorted(JOBS.values(),
                                           key=lambda j: j["created"], reverse=True)]
-            return self._json(200, {"jobs": jobs[:20], "files": list_files()})
+            return self._json(200, {"jobs": jobs[:20]})
 
         if path == "/api/config":
             return self._json(200, {
@@ -515,6 +509,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/dl/"):
             return self._serve_download(urllib.parse.unquote(path[4:]))
+
+        if path.startswith("/media/"):
+            return self._serve_media(urllib.parse.unquote(path[7:]))
 
         return self._json(404, {"error": "not found"})
 
@@ -539,6 +536,66 @@ class Handler(BaseHTTPRequestHandler):
             return
         with path.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile, 256 * 1024)
+
+    def _serve_media(self, name):
+        """Serve a file for inline playback, honouring Range requests.
+
+        Without 206 responses a browser cannot seek, and Safari refuses to start
+        playback at all, so range handling is not optional here.
+        """
+        path = safe_path(name)
+        if not path:
+            return self._json(404, {"error": "file not found"})
+
+        size = path.stat().st_size
+        ctype = MIME_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        start, end, status = 0, size - 1, 200
+
+        header = self.headers.get("Range", "")
+        if header.startswith("bytes="):
+            first, _, last = header[6:].split(",")[0].strip().partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                elif last:
+                    start = max(size - int(last), 0)     # suffix range: trailing N bytes
+            except ValueError:
+                start, end = 0, size - 1
+            else:
+                if start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                end = min(end, size - 1)
+                status = 206
+
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+
+        # Seeking makes browsers abort requests mid-flight; that is normal, not an error.
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (ConnectionError, OSError):
+            pass
 
     # ------------------------------------------------------------------ POST
 
@@ -579,6 +636,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # --------------------------------------------------------------------------- startup
+
+class Server(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already in
+    # use. Both then sit on the port and requests go to whichever the OS picks, so
+    # a stale instance keeps answering with old code. Disabling reuse there makes a
+    # duplicate launch fail loudly instead of silently misbehaving.
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
 
 def lan_addresses():
     """Every address the page may be reachable at from other devices.
@@ -623,7 +689,7 @@ def main():
 
     port = int(CFG["port"])
     try:
-        server = ThreadingHTTPServer((CFG["host"], port), Handler)
+        server = Server((CFG["host"], port), Handler)
     except OSError as exc:
         print(f"! Cannot listen on port {port}: {exc}")
         print("  Another copy may already be running, or change \"port\" in config.json.")
