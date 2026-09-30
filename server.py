@@ -10,6 +10,7 @@ only the yt-dlp and ffmpeg executables.
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -29,12 +30,12 @@ if hasattr(sys.stdout, "reconfigure"):
 BASE = Path(__file__).resolve().parent
 WEB = BASE / "web"
 JOBDIR = BASE / ".jobs"
-CONFIG_PATH = BASE / "config.json"
+CONFIG_PATH = Path(os.environ.get("VIDEO_DOWNLOADER_CONFIG") or BASE / "config.json")
 
 DEFAULT_CONFIG = {
     "host": "0.0.0.0",
     "port": 8777,
-    "download_dir": "downloads",
+    "download_dir": "",                     # empty = the browser's download folder
     "cookies_file": "",
     "cookies_from_browser": "",
     "ytdlp": "",
@@ -91,12 +92,127 @@ def load_config():
 
 CFG = load_config()
 
-# A relative download_dir is resolved against the project folder, so the app stays
-# portable: clone it anywhere and it still knows where to put files.
-_raw_dir = Path(CFG["download_dir"] or "downloads").expanduser()
-DOWNLOAD_DIR = (_raw_dir if _raw_dir.is_absolute() else BASE / _raw_dir).resolve()
+
+# --------------------------------------------------------------------------- download folder
+
+# User-data folders of Chromium browsers, in order of preference
+CHROMIUM_DIRS = {
+    "nt": [Path(os.environ.get("LOCALAPPDATA", "")) / p for p in (
+        "Google/Chrome/User Data", "Microsoft/Edge/User Data", "BraveSoftware/Brave-Browser/User Data")],
+    "darwin": [Path.home() / "Library/Application Support" / p for p in (
+        "Google/Chrome", "Microsoft Edge", "BraveSoftware/Brave-Browser")],
+    "linux": [Path.home() / ".config" / p for p in (
+        "google-chrome", "chromium", "microsoft-edge", "BraveSoftware/Brave-Browser")],
+}
+
+
+def chromium_download_dir():
+    """The download folder set in the browser's settings, for its last used profile.
+
+    None when no browser is found or the profile keeps the default: the browser then
+    saves to the system Downloads folder, and so do we.
+    """
+    key = "nt" if os.name == "nt" else sys.platform if sys.platform == "darwin" else "linux"
+    for base in CHROMIUM_DIRS[key]:
+        if not (base / "Local State").exists():
+            continue
+        try:
+            state = json.loads((base / "Local State").read_text(encoding="utf-8"))
+            profile = state.get("profile", {}).get("last_used") or "Default"
+            prefs = json.loads((base / profile / "Preferences").read_text(encoding="utf-8"))
+            folder = prefs.get("download", {}).get("default_directory")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return Path(folder) if folder and Path(folder).is_dir() else None
+    return None
+
+
+def system_downloads_dir():
+    """The user's Downloads folder, including one moved off the system drive."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+            # FOLDERID_Downloads {374DE290-123F-4565-9164-39C4925E467B}
+            downloads = GUID(0x374DE290, 0x123F, 0x4565,
+                             (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+            path = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(
+                    ctypes.byref(downloads), 0, None, ctypes.byref(path)) == 0:
+                try:
+                    return Path(path.value)
+                finally:
+                    ctypes.windll.ole32.CoTaskMemFree(path)
+        except (OSError, AttributeError):
+            pass
+    elif sys.platform != "darwin":
+        try:
+            found = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True,
+                                   encoding="utf-8", timeout=5).stdout.strip()
+            if found:
+                return Path(found)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return Path.home() / "Downloads"
+
+
+def browser_download_dir():
+    return chromium_download_dir() or system_downloads_dir()
+
+
+def resolve_download_dir(raw):
+    """An empty setting means the browser's folder; a relative one is resolved against
+    the project folder, so the app stays portable."""
+    if not raw:
+        return browser_download_dir().resolve()
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else BASE / path).resolve()
+
+
+DOWNLOAD_DIR = resolve_download_dir(CFG["download_dir"])
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 JOBDIR.mkdir(exist_ok=True)
+
+
+def set_download_dir(raw):
+    """Switch the folder for new downloads and remember it in config.json.
+
+    Downloads already running keep writing to the folder they started in.
+    """
+    global DOWNLOAD_DIR
+    raw = (raw or "").strip()
+    if raw and not Path(raw).expanduser().is_absolute():
+        raise ValueError("Enter a full path, e.g. D:\\Videos")
+    folder = resolve_download_dir(raw)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    CFG["download_dir"] = raw
+    try:
+        saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
+    except ValueError:
+        saved = {}
+    saved["download_dir"] = raw
+    CONFIG_PATH.write_text(json.dumps({**DEFAULT_CONFIG, **saved}, indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+    DOWNLOAD_DIR = folder
+    return folder
+
+
+# A native folder dialog, run as a separate process so Tk never touches the server's threads
+FOLDER_PICKER = """
+import sys, tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+print(filedialog.askdirectory(initialdir=sys.argv[1], title="Folder for downloaded videos") or "")
+"""
+PICKER_LOCK = threading.Lock()
 
 
 def find_tool(name, configured):
@@ -178,6 +294,35 @@ def clean_error(text):
     return (errors[-1] if errors else lines[-1])[:400]
 
 
+URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+CONTAINERS = ("mp4", "mkv", "webm")
+AUDIO_FORMATS = ("m4a", "mp3", "opus", "wav", "flac")
+FORMAT_ID_RE = re.compile(r"^[\w.+\-]{0,100}$")
+
+
+def check_url(url):
+    """The page is open to the whole network without a password, so whatever arrives as a
+    "link" must really be one: a value such as --exec=... would otherwise reach yt-dlp as an
+    option. It is also passed after "--", where yt-dlp never reads options."""
+    if not URL_RE.match(url) or len(url) > 2048:
+        raise ValueError("Only http:// and https:// links are supported")
+    return url
+
+
+def check_options(opts):
+    """Download options come from the network too: keep them to the values the page offers."""
+    height = str(opts.get("height") or "best")
+    if height != "best" and not height.isdigit():
+        raise ValueError("Invalid quality")
+    if opts.get("container") not in (None, "", *CONTAINERS):
+        raise ValueError("Invalid container")
+    if opts.get("audio_format") not in (None, "", *AUDIO_FORMATS):
+        raise ValueError("Invalid audio format")
+    if not FORMAT_ID_RE.match(str(opts.get("format_id") or "")):
+        raise ValueError("Invalid format id")
+    return opts
+
+
 def build_selector(opts):
     """Turn the UI choices into a yt-dlp -f selector."""
     explicit = (opts.get("format_id") or "").strip()
@@ -211,7 +356,7 @@ def probe(url):
         return cached[1]
 
     proc = subprocess.run(
-        base_args() + ["-J", url],
+        base_args() + ["-J", "--", check_url(url)],
         capture_output=True, encoding="utf-8", errors="replace",
         env=run_env(), timeout=180, creationflags=NO_WINDOW,
     )
@@ -265,7 +410,10 @@ PROG_PREFIX = "PROG|"
 
 
 def start_job(url, opts):
+    check_url(url)
+    check_options(opts)
     job_id = uuid.uuid4().hex[:12]
+    outdir = DOWNLOAD_DIR          # the folder can change while this job runs
     job = {
         "id": job_id,
         "url": url,
@@ -278,20 +426,17 @@ def start_job(url, opts):
         "downloaded": None,
         "total": None,
         "file": None,
+        "dir": str(outdir),
         "error": None,
         "created": time.time(),
     }
     with JOBS_LOCK:
         JOBS[job_id] = job
-    threading.Thread(target=download_worker, args=(job_id, url, opts), daemon=True).start()
+    threading.Thread(target=download_worker, args=(job_id, url, opts, outdir), daemon=True).start()
     return job_id
 
 
-def download_worker(job_id, url, opts):
-    job = JOBS[job_id]
-    # yt-dlp writes the final path here; parsing it out of stdout is far less reliable.
-    donefile = JOBDIR / f"{job_id}.txt"
-
+def download_command(url, opts, outdir, donefile):
     cmd = base_args() + [
         "--newline",
         "--concurrent-fragments", "4",
@@ -301,7 +446,7 @@ def download_worker(job_id, url, opts):
         "%(progress.speed)s|%(progress.eta)s",
         "--print-to-file", "after_move:filepath", str(donefile),
         "-f", build_selector(opts),
-        "-o", str(DOWNLOAD_DIR / "%(title)s [%(id)s].%(ext)s"),
+        "-o", str(outdir / "%(title)s [%(id)s].%(ext)s"),
     ]
 
     if opts.get("mode") == "audio":
@@ -314,7 +459,15 @@ def download_worker(job_id, url, opts):
         cmd += ["--write-thumbnail"]
     if opts.get("subtitles"):
         cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,ja,ru,-live_chat"]
-    cmd.append(url)
+    # After "--" yt-dlp treats everything as a URL, never as an option
+    return cmd + ["--", check_url(url)]
+
+
+def download_worker(job_id, url, opts, outdir):
+    job = JOBS[job_id]
+    # yt-dlp writes the final path here; parsing it out of stdout is far less reliable.
+    donefile = JOBDIR / f"{job_id}.txt"
+    cmd = download_command(url, opts, outdir, donefile)
 
     try:
         proc = subprocess.Popen(
@@ -387,24 +540,29 @@ def apply_progress(job, line):
 
 
 def finish(job, status, file=None, error=None):
-    job.update(status=status, finished=time.time(), proc=None)
+    # The status is set last: the page draws a finished job once, as soon as it sees the
+    # new status, so the file details (codecs take a moment to read) must already be there.
+    result = {"finished": time.time(), "proc": None}
     if file:
         path = Path(file)
         suffix = path.suffix.lower()
-        job["file"] = path.name
-        job["kind"] = "audio" if suffix in AUDIO_EXT else "video"
-        job["codecs"] = file_codecs(path) if suffix in MEDIA_EXT else None
+        result["file"] = path.name
+        result["dir"] = str(path.parent)
+        result["kind"] = "audio" if suffix in AUDIO_EXT else "video"
+        result["codecs"] = file_codecs(path) if suffix in MEDIA_EXT else None
         try:
-            job["size"] = path.stat().st_size
+            result["size"] = path.stat().st_size
         except OSError:
-            job["size"] = None
+            result["size"] = None
     if error:
-        job["error"] = error
-    job["stage"] = {
+        result["error"] = error
+    result["stage"] = {
         "done": "Done", "canceled": "Canceled", "error": "Failed",
     }.get(status, job.get("stage"))
     if status == "done":
-        job["percent"] = 100
+        result["percent"] = 100
+    job.update(result)
+    job["status"] = status
 
 
 def cancel_job(job_id):
@@ -451,11 +609,49 @@ def file_codecs(path):
 
 
 def safe_path(name):
-    """Resolve a requested filename, refusing anything outside the download folder."""
-    candidate = (DOWNLOAD_DIR / os.path.basename(name)).resolve()
-    if candidate.parent != DOWNLOAD_DIR or not candidate.is_file():
-        return None
-    return candidate
+    """Resolve a requested filename, refusing anything outside the download folders.
+
+    A file is looked up in the current folder, then in the folders finished downloads were
+    saved to, so their previews keep working after the folder is changed.
+    """
+    base = os.path.basename(name)
+    with JOBS_LOCK:
+        job_dirs = [Path(j["dir"]) for j in JOBS.values() if j.get("file") == base and j.get("dir")]
+    for folder in [DOWNLOAD_DIR, *job_dirs]:
+        folder = folder.resolve()
+        candidate = (folder / base).resolve()
+        if candidate.parent == folder and candidate.is_file():
+            return candidate
+    return None
+
+
+def local_addresses():
+    addresses = {"127.0.0.1", "::1", *lan_addresses()}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addresses.add(info[4][0])
+    except OSError:
+        pass
+    return addresses
+
+
+def is_local_client(ip):
+    """True for requests from the computer the server runs on (by any of its addresses)."""
+    if ip.startswith("::ffff:"):
+        ip = ip[7:]
+    return ip.startswith("127.") or ip in local_addresses()
+
+
+def pick_folder():
+    """Open a folder dialog on this computer. None when canceled or unavailable."""
+    proc = subprocess.run(
+        [sys.executable, "-c", FOLDER_PICKER, str(DOWNLOAD_DIR)],
+        capture_output=True, encoding="utf-8", errors="replace",
+        env=run_env(), timeout=600, creationflags=NO_WINDOW,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("The folder dialog is unavailable here (no tkinter): type the path instead")
+    return proc.stdout.strip() or None
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -495,17 +691,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/state":
             with JOBS_LOCK:
-                jobs = [{k: v for k, v in job.items() if k != "proc"}
+                jobs = [{k: v for k, v in job.items() if k not in ("proc", "dir")}
                         for job in sorted(JOBS.values(),
                                           key=lambda j: j["created"], reverse=True)]
             return self._json(200, {"jobs": jobs[:20]})
 
         if path == "/api/config":
-            return self._json(200, {
-                "download_dir": str(DOWNLOAD_DIR),
-                "cookies": bool(cookie_args()),
-                "ffmpeg": bool(FFMPEG),
-            })
+            return self._json(200, self._config())
 
         if path.startswith("/dl/"):
             return self._serve_download(urllib.parse.unquote(path[4:]))
@@ -514,6 +706,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._serve_media(urllib.parse.unquote(path[7:]))
 
         return self._json(404, {"error": "not found"})
+
+    def _is_local(self):
+        return is_local_client(self.client_address[0])
+
+    def _config(self):
+        return {
+            "download_dir": str(DOWNLOAD_DIR),
+            "auto_dir": not CFG.get("download_dir"),
+            "browser_dir": str(browser_download_dir()),
+            # Only the computer running the server may choose where it writes files
+            "can_change_dir": self._is_local(),
+            "cookies": bool(cookie_args()),
+            "ffmpeg": bool(FFMPEG),
+        }
 
     def _static(self, path, ctype):
         if not path.exists():
@@ -612,6 +818,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "no URL given"})
             try:
                 return self._json(200, probe(url))
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
             except subprocess.TimeoutExpired:
                 return self._json(504, {"error": "yt-dlp did not respond within 3 minutes"})
             except Exception as exc:
@@ -621,7 +829,30 @@ class Handler(BaseHTTPRequestHandler):
             url = (data.get("url") or "").strip()
             if not url:
                 return self._json(400, {"error": "no URL given"})
-            return self._json(200, {"id": start_job(url, data)})
+            try:
+                return self._json(200, {"id": start_job(url, data)})
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+
+        if path in ("/api/folder", "/api/pick-folder"):
+            if not self._is_local():
+                return self._json(403, {"error": "The folder can only be changed on the computer running the server"})
+            try:
+                if path == "/api/pick-folder":
+                    if not PICKER_LOCK.acquire(blocking=False):
+                        return self._json(409, {"error": "The folder dialog is already open"})
+                    try:
+                        picked = pick_folder()
+                    finally:
+                        PICKER_LOCK.release()
+                    if picked is None:
+                        return self._json(200, {"canceled": True, **self._config()})
+                    set_download_dir(picked)
+                else:
+                    set_download_dir(data.get("path"))
+            except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                return self._json(400, {"error": str(exc)})
+            return self._json(200, self._config())
 
         if path == "/api/cancel":
             return self._json(200, {"ok": cancel_job(data.get("id"))})
@@ -705,7 +936,7 @@ def main():
             print(f"  Other devices : http://{addresses[0]}:{port}   (same network)")
             for extra in addresses[1:]:
                 print(f"                  http://{extra}:{port}   (alternative)")
-    print(f"  Download dir  : {DOWNLOAD_DIR}")
+    print(f"  Download dir  : {DOWNLOAD_DIR}" + ("   (the browser's folder)" if not CFG.get("download_dir") else ""))
     print(f"  Cookies       : {'loaded' if cookie_args() else 'none (Niconico may refuse)'}")
     print("=" * 60)
     print("  Press Ctrl+C to stop")

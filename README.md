@@ -44,7 +44,7 @@ where to open it:
 ```
 This machine  : http://localhost:8777
 Other devices : http://192.168.1.42:8777   (same network)
-Download dir  : /home/you/video-downloader/downloads
+Download dir  : /home/you/Downloads   (the browser's folder)
 ```
 
 Stop with `Ctrl+C`.
@@ -59,8 +59,23 @@ Stop with `Ctrl+C`.
    want one specific stream.
 3. Press **Download**. Progress, speed and ETA appear below.
 
-That is the whole download. The file is written straight to `download_dir` on the
+That is the whole download. The file is written straight to the download folder on the
 machine running the server — nothing else is needed.
+
+## Download folder
+
+By default files go to the same folder your browser saves downloads to: the folder set
+in Chrome, Edge or Brave (for the profile used last), or the system **Downloads** folder
+when the browser keeps its default.
+
+To change it, use the **Download folder** section at the bottom of the page: type a full
+path and press **Save**, or press **Browse…** to pick a folder in a dialog. **Use the
+browser's folder** goes back to the default. The choice is saved to `config.json`.
+
+The folder can only be changed on the computer running the server. Other devices see
+where files go but get no controls, and the server refuses such requests from them:
+otherwise anyone on the network could make it write files anywhere on the disk.
+Finished downloads stay playable on the page after the folder is changed.
 
 When a job finishes it turns into a player right there on the page, with the file's
 real codecs and size next to it, so you can confirm what you got without opening the
@@ -98,7 +113,7 @@ Restart the server after editing.
 
 | Key | Meaning |
 |---|---|
-| `download_dir` | where files land. Relative paths resolve against the project folder, so `"downloads"` stays portable |
+| `download_dir` | where files land. Empty (default) = the browser's download folder. Relative paths resolve against the project folder, so `"downloads"` stays portable. Usually set from the page instead |
 | `cookies_file` | Netscape-format cookie file. Niconico needs one for most videos |
 | `cookies_from_browser` | alternative: `chrome`, `firefox`, `edge` — read cookies straight from a browser profile |
 | `port` | default `8777` |
@@ -119,6 +134,10 @@ Cookies expire. When downloads start failing with a login error, export a fresh 
 
 - **No authentication.** With `host: 0.0.0.0` anyone on the network can open the
   page and download through it. Fine on a home network; set `127.0.0.1` on public Wi-Fi.
+  Only `http://` and `https://` links are accepted, and they are passed to yt-dlp after
+  `--`, so a "link" such as `--exec=...` can never turn into a yt-dlp option. The other
+  download options are limited to the values the page offers.
+- **Tests:** `python -m unittest discover -s tests -v` (no network or yt-dlp runs).
 - **Playlists are disabled** (`--no-playlist`): a link to a video inside a playlist
   downloads that one video, not the whole list.
 - **MKV does not preview.** Browsers cannot play the Matroska container, so the

@@ -37,6 +37,8 @@
   }
 
   * { box-sizing: border-box; }
+  /* display rules such as .grid would otherwise override the hidden attribute */
+  [hidden] { display: none !important; }
   body {
     margin: 0;
     padding: 16px;
@@ -288,6 +290,23 @@
       <button class="small" id="clearJobs">Clear list</button>
     </div>
     <div id="jobs"><div class="empty">Nothing downloaded yet.</div></div>
+  </div>
+
+  <div class="card">
+    <b style="font-size:14px">Download folder</b>
+    <div class="hint" id="folderNow" style="margin-top:4px; word-break: break-all"></div>
+    <div id="folderEdit" hidden>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="folderPath" style="flex: 3 1 260px" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="folderSave" style="flex: 0 0 auto">Save</button>
+      </div>
+      <div class="actions">
+        <button class="small" id="folderBrowse">Browse…</button>
+        <button class="small" id="folderAuto">Use the browser's folder</button>
+      </div>
+      <div id="folderErr" class="err-text" hidden></div>
+    </div>
+    <div class="hint" id="folderRemote" hidden>The folder can be changed only on the computer running the server.</div>
   </div>
 
 </div>
@@ -690,14 +709,47 @@ async function refresh() {
   }
 }
 
+function renderConfig(cfg) {
+  const where = cfg.download_dir + (cfg.auto_dir ? " (the browser's folder)" : "");
+  $("dlDir").textContent = "Saving to " + where + (cfg.cookies ? "" : " · no cookies");
+  $("folderNow").textContent = "New downloads go to " + where;
+  $("folderEdit").hidden = !cfg.can_change_dir;
+  $("folderRemote").hidden = cfg.can_change_dir;
+  $("folderPath").value = cfg.auto_dir ? "" : cfg.download_dir;
+  $("folderPath").placeholder = cfg.browser_dir + " (the browser's folder)";
+  $("folderAuto").disabled = cfg.auto_dir;
+}
+
 async function loadConfig() {
   try {
-    const cfg = await api("/api/config");
-    $("dlDir").textContent = "Saving to " + cfg.download_dir + (cfg.cookies ? "" : " · no cookies");
+    renderConfig(await api("/api/config"));
   } catch (e) {
     // Not critical: the page works without this label.
   }
 }
+
+// Changing the folder is allowed only on the server's own computer; the server checks it too.
+async function changeFolder(path, body, button) {
+  $("folderErr").hidden = true;
+  button.disabled = true;
+  try {
+    const cfg = await api(path, body);
+    renderConfig(cfg);
+  } catch (e) {
+    $("folderErr").hidden = false;
+    $("folderErr").textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("folderSave").addEventListener("click", () =>
+  changeFolder("/api/folder", { path: $("folderPath").value.trim() }, $("folderSave")));
+$("folderPath").addEventListener("keydown", e => {
+  if (e.key === "Enter") changeFolder("/api/folder", { path: $("folderPath").value.trim() }, $("folderSave"));
+});
+$("folderAuto").addEventListener("click", () => changeFolder("/api/folder", { path: "" }, $("folderAuto")));
+$("folderBrowse").addEventListener("click", () => changeFolder("/api/pick-folder", {}, $("folderBrowse")));
 
 applyPreset("edit");
 loadConfig();
