@@ -601,7 +601,7 @@ function resultBlock(j) {
   player.className = "player";
   player.controls = true;
   player.preload = "metadata";
-  player.src = "/media/" + encodeURIComponent(file);
+  player.src = "/media/" + encodeURIComponent(j.id);
 
   // MKV and exotic codec combinations cannot be played by browsers at all.
   const note = document.createElement("div");
@@ -620,7 +620,7 @@ function resultBlock(j) {
 
   const save = document.createElement("a");
   save.className = "btnlink";
-  save.href = "/dl/" + encodeURIComponent(file);
+  save.href = "/dl/" + encodeURIComponent(j.id);
   save.setAttribute("download", file);
   save.textContent = "Save to this device";
 

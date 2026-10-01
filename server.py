@@ -15,10 +15,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,7 +35,7 @@ JOBDIR = BASE / ".jobs"
 CONFIG_PATH = Path(os.environ.get("VIDEO_DOWNLOADER_CONFIG") or BASE / "config.json")
 
 DEFAULT_CONFIG = {
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
     "port": 8777,
     "download_dir": "",                     # empty = the browser's download folder
     "cookies_file": "",
@@ -41,6 +43,18 @@ DEFAULT_CONFIG = {
     "ytdlp": "",
     "ffmpeg": "",
 }
+
+VERSION = "1.0.0"
+MAX_JSON_BODY = 64 * 1024
+MAX_ACTIVE_DOWNLOADS = 3
+MAX_CONCURRENT_PROBES = 2
+MAX_PROBE_CACHE = 64
+MAX_RETAINED_JOBS = 100
+ALLOWED_SITES = ("youtube.com", "youtu.be", "youtube-nocookie.com", "nicovideo.jp", "nico.ms")
+
+
+class BusyError(RuntimeError):
+    """A bounded resource is busy; the client may retry later."""
 
 MEDIA_EXT = (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".opus", ".wav", ".flac")
 AUDIO_EXT = (".m4a", ".mp3", ".opus", ".wav", ".flac")
@@ -197,8 +211,16 @@ def set_download_dir(raw):
     except ValueError:
         saved = {}
     saved["download_dir"] = raw
-    CONFIG_PATH.write_text(json.dumps({**DEFAULT_CONFIG, **saved}, indent=2, ensure_ascii=False) + "\n",
-                           encoding="utf-8")
+    contents = json.dumps({**DEFAULT_CONFIG, **saved}, indent=2, ensure_ascii=False) + "\n"
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=CONFIG_PATH.parent,
+                                     prefix=CONFIG_PATH.name + ".", delete=False) as handle:
+        handle.write(contents)
+        temporary = Path(handle.name)
+    try:
+        os.replace(temporary, CONFIG_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
     DOWNLOAD_DIR = folder
     return folder
 
@@ -243,7 +265,9 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-PROBE_CACHE = {}
+PROBE_CACHE = OrderedDict()
+PROBE_CACHE_LOCK = threading.Lock()
+PROBE_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_PROBES)
 
 
 # --------------------------------------------------------------------------- yt-dlp
@@ -304,8 +328,13 @@ def check_url(url):
     """The page is open to the whole network without a password, so whatever arrives as a
     "link" must really be one: a value such as --exec=... would otherwise reach yt-dlp as an
     option. It is also passed after "--", where yt-dlp never reads options."""
-    if not URL_RE.match(url) or len(url) > 2048:
-        raise ValueError("Only http:// and https:// links are supported")
+    if not isinstance(url, str) or not URL_RE.match(url) or len(url) > 2048:
+        raise ValueError("Only YouTube and Niconico links are supported")
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if parsed.username or parsed.password or not any(
+            host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_SITES):
+        raise ValueError("Only YouTube and Niconico links are supported")
     return url
 
 
@@ -351,15 +380,24 @@ def build_selector(opts):
 
 def probe(url):
     """Fetch metadata and the real format list for a URL (cached for 5 minutes)."""
-    cached = PROBE_CACHE.get(url)
-    if cached and time.time() - cached[0] < 300:
-        return cached[1]
+    url = check_url(url)
+    with PROBE_CACHE_LOCK:
+        cached = PROBE_CACHE.get(url)
+        if cached and time.time() - cached[0] < 300:
+            PROBE_CACHE.move_to_end(url)
+            return cached[1]
+        PROBE_CACHE.pop(url, None)
 
-    proc = subprocess.run(
-        base_args() + ["-J", "--", check_url(url)],
-        capture_output=True, encoding="utf-8", errors="replace",
-        env=run_env(), timeout=180, creationflags=NO_WINDOW,
-    )
+    if not PROBE_SLOTS.acquire(blocking=False):
+        raise BusyError("Too many links are being checked; try again shortly")
+    try:
+        proc = subprocess.run(
+            base_args() + ["-J", "--", url],
+            capture_output=True, encoding="utf-8", errors="replace",
+            env=run_env(), timeout=180, creationflags=NO_WINDOW,
+        )
+    finally:
+        PROBE_SLOTS.release()
     if proc.returncode != 0:
         raise RuntimeError(clean_error(proc.stderr) or "yt-dlp could not read the page")
 
@@ -400,7 +438,11 @@ def probe(url):
         "acodecs": sorted(acodecs),
         "formats": formats,
     }
-    PROBE_CACHE[url] = (time.time(), info)
+    with PROBE_CACHE_LOCK:
+        PROBE_CACHE[url] = (time.time(), info)
+        PROBE_CACHE.move_to_end(url)
+        while len(PROBE_CACHE) > MAX_PROBE_CACHE:
+            PROBE_CACHE.popitem(last=False)
     return info
 
 
@@ -431,6 +473,16 @@ def start_job(url, opts):
         "created": time.time(),
     }
     with JOBS_LOCK:
+        if sum(j.get("status") == "running" for j in JOBS.values()) >= MAX_ACTIVE_DOWNLOADS:
+            raise BusyError(f"At most {MAX_ACTIVE_DOWNLOADS} downloads can run at once")
+        excess = len(JOBS) - MAX_RETAINED_JOBS + 1
+        if excess > 0:
+            completed = sorted(
+                ((key, j) for key, j in JOBS.items() if j.get("status") != "running"),
+                key=lambda item: item[1].get("created", 0),
+            )
+            for old_id, _ in completed[:excess]:
+                JOBS.pop(old_id, None)
         JOBS[job_id] = job
     threading.Thread(target=download_worker, args=(job_id, url, opts, outdir), daemon=True).start()
     return job_id
@@ -608,21 +660,42 @@ def file_codecs(path):
     return found
 
 
-def safe_path(name):
-    """Resolve a requested filename, refusing anything outside the download folders.
-
-    A file is looked up in the current folder, then in the folders finished downloads were
-    saved to, so their previews keep working after the folder is changed.
-    """
-    base = os.path.basename(name)
+def safe_job_path(job_id):
+    """Return exactly the media file recorded for one completed download job."""
+    if not re.fullmatch(r"[0-9a-f]{1,32}", job_id or ""):
+        return None
     with JOBS_LOCK:
-        job_dirs = [Path(j["dir"]) for j in JOBS.values() if j.get("file") == base and j.get("dir")]
-    for folder in [DOWNLOAD_DIR, *job_dirs]:
-        folder = folder.resolve()
-        candidate = (folder / base).resolve()
-        if candidate.parent == folder and candidate.is_file():
-            return candidate
+        job = JOBS.get(job_id)
+        if not job or job.get("status") != "done" or not job.get("file") or not job.get("dir"):
+            return None
+        name, directory = job["file"], job["dir"]
+    if name != os.path.basename(name):
+        return None
+    folder = Path(directory).resolve()
+    candidate = (folder / name).resolve()
+    if candidate.parent == folder and candidate.is_file() and candidate.suffix.lower() in MEDIA_EXT:
+        return candidate
     return None
+
+
+def parse_range(header, size):
+    """Parse one RFC 7233 byte range, rejecting malformed and reversed ranges."""
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+    if not match or size <= 0:
+        raise ValueError("invalid range")
+    first, last = match.groups()
+    if not first and not last:
+        raise ValueError("invalid range")
+    if first:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if start >= size or end < start:
+            raise ValueError("range not satisfiable")
+        return start, min(end, size - 1)
+    suffix = int(last)
+    if suffix <= 0:
+        raise ValueError("range not satisfiable")
+    return max(size - suffix, 0), size - 1
 
 
 def local_addresses():
@@ -657,17 +730,31 @@ def pick_folder():
 # --------------------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoDownloader/1.0"
+    server_version = f"VideoDownloader/{VERSION}"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
         pass                                    # keep the console readable
 
+    def _security_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; "
+            "connect-src 'self'; img-src 'self' https: data:; media-src 'self' blob:; "
+            "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
+        )
+
     def _send(self, code, body=b"", ctype="application/json; charset=utf-8", extra=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -678,8 +765,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(length) or b"{}")
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > MAX_JSON_BODY:
+            raise OverflowError(f"request body must not exceed {MAX_JSON_BODY // 1024} KB")
+        data = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        return data
+
+    def _same_origin(self):
+        """Reject browser writes initiated by a different site (CSRF)."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        parsed = urllib.parse.urlsplit(origin)
+        return parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.headers.get("Host", "").lower()
 
     # ------------------------------------------------------------------ GET
 
@@ -707,16 +813,20 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._json(404, {"error": "not found"})
 
+    def do_HEAD(self):
+        return self.do_GET()
+
     def _is_local(self):
         return is_local_client(self.client_address[0])
 
     def _config(self):
+        local = self._is_local()
         return {
-            "download_dir": str(DOWNLOAD_DIR),
+            "download_dir": str(DOWNLOAD_DIR) if local else DOWNLOAD_DIR.name,
             "auto_dir": not CFG.get("download_dir"),
-            "browser_dir": str(browser_download_dir()),
+            "browser_dir": str(browser_download_dir()) if local else "",
             # Only the computer running the server may choose where it writes files
-            "can_change_dir": self._is_local(),
+            "can_change_dir": local,
             "cookies": bool(cookie_args()),
             "ffmpeg": bool(FFMPEG),
         }
@@ -726,9 +836,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": f"{path.name} not found"})
         self._send(200, path.read_bytes(), ctype)
 
-    def _serve_download(self, name):
+    def _serve_download(self, job_id):
         """Stream a finished file, so a phone can pull it off the machine."""
-        path = safe_path(name)
+        path = safe_job_path(job_id)
         if not path:
             return self._json(404, {"error": "file not found"})
 
@@ -737,19 +847,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(path.stat().st_size))
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quoted}")
+        self._security_headers()
         self.end_headers()
         if self.command == "HEAD":
             return
         with path.open("rb") as handle:
             shutil.copyfileobj(handle, self.wfile, 256 * 1024)
 
-    def _serve_media(self, name):
+    def _serve_media(self, job_id):
         """Serve a file for inline playback, honouring Range requests.
 
         Without 206 responses a browser cannot seek, and Safari refuses to start
         playback at all, so range handling is not optional here.
         """
-        path = safe_path(name)
+        path = safe_job_path(job_id)
         if not path:
             return self._json(404, {"error": "file not found"})
 
@@ -758,25 +869,17 @@ class Handler(BaseHTTPRequestHandler):
         start, end, status = 0, size - 1, 200
 
         header = self.headers.get("Range", "")
-        if header.startswith("bytes="):
-            first, _, last = header[6:].split(",")[0].strip().partition("-")
+        if header:
             try:
-                if first:
-                    start = int(first)
-                    end = int(last) if last else size - 1
-                elif last:
-                    start = max(size - int(last), 0)     # suffix range: trailing N bytes
+                start, end = parse_range(header, size)
             except ValueError:
-                start, end = 0, size - 1
-            else:
-                if start >= size:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                end = min(end, size - 1)
-                status = 206
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self._security_headers()
+                self.end_headers()
+                return
+            status = 206
 
         length = end - start + 1
         self.send_response(status)
@@ -785,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         if status == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self._security_headers()
         self.end_headers()
         if self.command == "HEAD":
             return
@@ -807,10 +911,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if not self._same_origin():
+            return self._json(403, {"error": "cross-site requests are not allowed"})
         try:
             data = self._read_json()
-        except Exception:
-            return self._json(400, {"error": "malformed JSON"})
+        except OverflowError as exc:
+            self.close_connection = True
+            return self._json(413, {"error": str(exc)})
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self._json(400, {"error": str(exc) or "malformed JSON"})
 
         if path == "/api/probe":
             url = (data.get("url") or "").strip()
@@ -822,6 +931,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(exc)})
             except subprocess.TimeoutExpired:
                 return self._json(504, {"error": "yt-dlp did not respond within 3 minutes"})
+            except BusyError as exc:
+                return self._json(429, {"error": str(exc)})
             except Exception as exc:
                 return self._json(502, {"error": str(exc)})
 
@@ -831,6 +942,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "no URL given"})
             try:
                 return self._json(200, {"id": start_job(url, data)})
+            except BusyError as exc:
+                return self._json(429, {"error": str(exc)})
             except ValueError as exc:
                 return self._json(400, {"error": str(exc)})
 

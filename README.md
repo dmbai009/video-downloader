@@ -2,7 +2,8 @@
 
 A small local web UI for downloading videos from **YouTube** and **Niconico** with
 control over quality, codec and container. It runs on your own machine and is
-reachable from any device on the same network — phone, tablet, another laptop.
+reachable there by default, or from a phone, tablet or another laptop when
+local-network access is enabled.
 
 Under the hood it is a thin wrapper around [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 and ffmpeg. The server is plain Python standard library: no Flask, no npm, no build step.
@@ -30,7 +31,7 @@ If either tool lives somewhere unusual, point `config.json` at it directly.
 ## Running
 
 ```
-git clone https://github.com/<you>/video-downloader.git
+git clone https://github.com/dmbai009/video-downloader.git
 cd video-downloader
 ```
 
@@ -43,9 +44,12 @@ where to open it:
 
 ```
 This machine  : http://localhost:8777
-Other devices : http://192.168.1.42:8777   (same network)
 Download dir  : /home/you/Downloads   (the browser's folder)
 ```
+
+The secure default is `host: 127.0.0.1`, which only accepts connections from this
+computer. To use the page from another device on a trusted home network, change it
+to `0.0.0.0` and restart; the console will then print the LAN address as well.
 
 Stop with `Ctrl+C`.
 
@@ -117,7 +121,7 @@ Restart the server after editing.
 | `cookies_file` | Netscape-format cookie file. Niconico needs one for most videos |
 | `cookies_from_browser` | alternative: `chrome`, `firefox`, `edge` — read cookies straight from a browser profile |
 | `port` | default `8777` |
-| `host` | `0.0.0.0` for other devices, `127.0.0.1` to keep it to this machine |
+| `host` | `127.0.0.1` by default; use `0.0.0.0` for other devices on a trusted local network |
 | `ytdlp`, `ffmpeg` | explicit executable paths when auto-detection fails |
 
 ### Cookies
@@ -130,13 +134,23 @@ so neither the file nor its location gets committed.
 
 Cookies expire. When downloads start failing with a login error, export a fresh file.
 
+## Security
+
+- The server has no user accounts. Keep the default `127.0.0.1` on public or
+  untrusted networks. With `host: 0.0.0.0`, every device on the LAN can deliberately
+  open and use the downloader.
+- Browser writes must be same-origin JSON and request bodies are size-limited, which
+  prevents ordinary cross-site request attacks. Finished media is served only through
+  its completed-job ID, never by an arbitrary filename from Downloads.
+- Only YouTube and Niconico links are accepted. They are passed to yt-dlp after `--`,
+  so a value such as `--exec=...` can never become an option. Download choices are
+  restricted to values offered by the page, active downloads and probes are bounded,
+  and responses carry restrictive browser security headers.
+- This is still a local tool, not an internet-facing service. Do not port-forward it
+  or expose it through a public reverse proxy.
+
 ## Notes
 
-- **No authentication.** With `host: 0.0.0.0` anyone on the network can open the
-  page and download through it. Fine on a home network; set `127.0.0.1` on public Wi-Fi.
-  Only `http://` and `https://` links are accepted, and they are passed to yt-dlp after
-  `--`, so a "link" such as `--exec=...` can never turn into a yt-dlp option. The other
-  download options are limited to the values the page offers.
 - **Tests:** `python -m unittest discover -s tests -v` (no network or yt-dlp runs).
 - **Playlists are disabled** (`--no-playlist`): a link to a video inside a playlist
   downloads that one video, not the whole list.

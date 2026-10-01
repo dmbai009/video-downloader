@@ -29,17 +29,24 @@ class Client:
     def __init__(self, port):
         self.port = port
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, headers=None, return_headers=False):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        payload = json.dumps(body).encode() if body is not None else None
-        conn.request(method, path, body=payload, headers={"Content-Type": "application/json"})
+        payload = (body if isinstance(body, bytes) else json.dumps(body).encode()) if body is not None else None
+        request_headers = {"Content-Type": "application/json"}
+        request_headers.update(headers or {})
+        conn.request(method, path, body=payload, headers=request_headers)
         res = conn.getresponse()
         data = res.read()
+        response_headers = dict(res.getheaders())
         conn.close()
         try:
-            return res.status, json.loads(data)
+            if response_headers.get("Content-Type", "").startswith("application/json"):
+                result = (res.status, json.loads(data))
+            else:
+                raise ValueError
         except ValueError:
-            return res.status, data
+            result = (res.status, data)
+        return (*result, response_headers) if return_headers else result
 
     def post(self, path, body):
         return self.request("POST", path, body)
@@ -67,10 +74,12 @@ class ServerTest(unittest.TestCase):
 
 class UrlChecks(ServerTest):
     def test_only_http_links_are_accepted(self):
-        for url in ("https://www.youtube.com/watch?v=abc", "http://nicovideo.jp/watch/sm9", "HTTPS://X.COM/a"):
+        for url in ("https://www.youtube.com/watch?v=abc", "http://nicovideo.jp/watch/sm9",
+                    "HTTPS://M.YOUTUBE.COM/a", "https://nico.ms/sm9"):
             self.assertEqual(server.check_url(url), url)
         for url in ("--exec=calc", "-o C:/x", "--config-locations=//evil/share/c", "file:///C:/Windows",
-                    "ftp://x/y", "https://a b", "", "https://" + "a" * 3000):
+                    "ftp://x/y", "https://x.com/a", "https://youtube.com@example.com/a",
+                    "https://a b", "", "https://" + "a" * 3000):
             with self.assertRaises(ValueError, msg=url):
                 server.check_url(url)
 
@@ -83,7 +92,7 @@ class UrlChecks(ServerTest):
         with mock.patch.object(server.subprocess, "run", side_effect=AssertionError("yt-dlp was run")):
             status, body = self.client.post("/api/probe", {"url": "--exec=calc.exe"})
         self.assertEqual(status, 400)
-        self.assertIn("http", body["error"])
+        self.assertIn("YouTube", body["error"])
 
     def test_download_refuses_bad_links_and_options_without_starting_a_job(self):
         cases = [
@@ -145,14 +154,86 @@ class DownloadFolder(ServerTest):
         old = server.DOWNLOAD_DIR
         (old / "clip.mp4").write_bytes(b"video")
         with server.JOBS_LOCK:
-            server.JOBS["j1"] = {"id": "j1", "status": "done", "file": "clip.mp4", "dir": str(old), "created": 1}
+            server.JOBS["a1"] = {"id": "a1", "status": "done", "file": "clip.mp4", "dir": str(old), "created": 1}
         server.set_download_dir(str(TMP / "elsewhere"))
-        status, body = self.client.get("/media/clip.mp4")
+        status, body = self.client.get("/media/a1")
         self.assertEqual((status, body), (200, b"video"))
-        # but nothing outside the download folders
+        # A guessed filename is never enough; only the opaque completed job id works.
+        self.assertEqual(self.client.get("/media/clip.mp4")[0], 404)
         self.assertEqual(self.client.get("/media/..%2Fconfig.json")[0], 404)
         _, state = self.client.get("/api/state")
         self.assertNotIn("dir", state["jobs"][0], "folder paths are not sent to other devices")
+
+
+class HttpSecurity(ServerTest):
+    def finished_job(self, data=b"0123456789"):
+        path = server.DOWNLOAD_DIR / "clip.mp4"
+        path.write_bytes(data)
+        with server.JOBS_LOCK:
+            server.JOBS["abc123"] = {
+                "id": "abc123", "status": "done", "file": path.name,
+                "dir": str(path.parent), "created": 1,
+            }
+        return path
+
+    def test_post_requires_small_json_objects(self):
+        status, _ = self.client.request(
+            "POST", "/api/forget", b"{}", headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 400)
+        status, _ = self.client.request("POST", "/api/forget", b"[]")
+        self.assertEqual(status, 400)
+        status, _ = self.client.request(
+            "POST", "/api/forget", b" " * (server.MAX_JSON_BODY + 1))
+        self.assertEqual(status, 413)
+
+    def test_cross_site_posts_are_rejected(self):
+        status, _ = self.client.request(
+            "POST", "/api/forget", {}, headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        origin = f"http://127.0.0.1:{self.client.port}"
+        status, _ = self.client.request("POST", "/api/forget", {}, headers={"Origin": origin})
+        self.assertEqual(status, 200)
+
+    def test_media_is_bound_to_a_completed_job(self):
+        path = self.finished_job()
+        self.assertEqual(self.client.get("/media/abc123"), (200, path.read_bytes()))
+        with server.JOBS_LOCK:
+            server.JOBS["abc123"]["status"] = "running"
+        self.assertEqual(self.client.get("/media/abc123")[0], 404)
+
+    def test_ranges_and_head_are_strict(self):
+        self.finished_job()
+        status, body, headers = self.client.request(
+            "GET", "/media/abc123", headers={"Range": "bytes=2-5"}, return_headers=True)
+        self.assertEqual((status, body), (206, b"2345"))
+        self.assertEqual(headers["Content-Range"], "bytes 2-5/10")
+        for invalid in ("bytes=7-3", "bytes=10-", "bytes=-0", "bytes=1-2,4-5", "nonsense"):
+            self.assertEqual(self.client.request(
+                "GET", "/media/abc123", headers={"Range": invalid})[0], 416, invalid)
+        status, body, headers = self.client.request(
+            "HEAD", "/media/abc123", return_headers=True)
+        self.assertEqual((status, body, headers["Content-Length"]), (200, b"", "10"))
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+
+    def test_downloads_are_bounded(self):
+        with server.JOBS_LOCK:
+            for index in range(server.MAX_ACTIVE_DOWNLOADS):
+                server.JOBS[str(index)] = {"status": "running"}
+        status, body = self.client.post("/api/download", {"url": "https://youtu.be/x"})
+        self.assertEqual(status, 429)
+        self.assertIn("At most", body["error"])
+
+    def test_only_recent_jobs_are_retained(self):
+        with server.JOBS_LOCK:
+            for index in range(server.MAX_RETAINED_JOBS):
+                key = f"old{index}"
+                server.JOBS[key] = {"id": key, "status": "done", "created": index}
+        with mock.patch.object(server.threading, "Thread") as thread:
+            new_id = server.start_job("https://youtu.be/x", {})
+        self.assertEqual(len(server.JOBS), server.MAX_RETAINED_JOBS)
+        self.assertNotIn("old0", server.JOBS)
+        self.assertIn(new_id, server.JOBS)
+        thread.return_value.start.assert_called_once()
 
 
 class FinishedJob(unittest.TestCase):
