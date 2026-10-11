@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 - 2026-10-11
+
+- Download a video or audio time range with optional start/end and millisecond input.
+- Keep whole-video downloads as the default when both fields are blank.
+- Apply presets, codec/container choices and audio conversion to clips, with clean cuts.
+- Validate ranges against source duration and reject live-stream clipping.
+- Give clips distinct filenames and show the selected interval in download progress.
+- Add offline media integration tests and UI checks for time-range controls.
+
 ## 1.0.0 - 2026-10-01
 
 First public release.

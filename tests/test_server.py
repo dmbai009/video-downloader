@@ -3,7 +3,8 @@
 Run:  python -m unittest discover -s tests -v
 
 The server module is imported with a temporary config.json, so the real settings and
-download folder are never touched, and yt-dlp is never actually run.
+download folder are never touched. These unit tests mock yt-dlp; test_clip_media.py
+contains optional integration tests against synthetic local media.
 """
 
 import http.client
@@ -107,6 +108,100 @@ class UrlChecks(ServerTest):
                 status, _ = self.client.post("/api/download", body)
                 self.assertEqual(status, 400, body)
         self.assertEqual(server.JOBS, {})
+
+
+class ClipRanges(unittest.TestCase):
+    def test_timestamp_formats_and_open_ranges(self):
+        for text, seconds in (("90", 90), ("1:30.125", 90.125), ("2:03:04.5", 7384.5),
+                              ("90:00", 5400), (0, 0), (" 0.001 ", .001)):
+            self.assertEqual(server.parse_timestamp(text, "start"), seconds)
+        self.assertIsNone(server.clip_range({}))
+        self.assertIsNone(server.clip_range({"start_time": " ", "end_time": ""}))
+        self.assertEqual(server.clip_range({"end_time": "1:30"}), (0, 90))
+        self.assertEqual(server.clip_range({"start_time": "10"}), (10, None))
+
+    def test_invalid_times_and_empty_or_reversed_ranges(self):
+        for value in (True, False, [], {}, -1, "-1", "nan", float("inf"), "1:60",
+                      "1:60:00", "1::2", "1:2:3:4", "1.2:03", "0.0001",
+                      "--exec=calc", "1e3", "9" * 40):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                server.clip_range({"start_time": value})
+        for start, end in (("", "0"), ("10", "10"), ("20", "10")):
+            with self.assertRaises(ValueError):
+                server.clip_range({"start_time": start, "end_time": end})
+
+    def test_whole_video_command_keeps_existing_behavior(self):
+        cmd = server.download_command("https://youtu.be/x", {}, TMP, TMP / "done")
+        self.assertNotIn("--download-sections", cmd)
+        self.assertNotIn("--force-keyframes-at-cuts", cmd)
+        self.assertEqual(Path(cmd[cmd.index("-o") + 1]).name, "%(title)s [%(id)s].%(ext)s")
+
+    def test_clips_keep_format_selection_and_extras_and_have_distinct_names(self):
+        opts = {"start_time": "1:00.125", "end_time": "1:30.5", "vcodec": "h264",
+                "acodec": "aac", "container": "mp4", "height": "720",
+                "metadata": True, "thumbnail": True, "subtitles": True}
+        cmd = server.download_command("https://youtu.be/x", opts, TMP, TMP / "done")
+        self.assertEqual(cmd[cmd.index("--download-sections") + 1], "*60.125-90.5")
+        self.assertEqual(cmd[cmd.index("-f") + 1], server.build_selector(opts))
+        encoding = cmd[cmd.index("--downloader-args") + 1]
+        self.assertIn("libx264", encoding)
+        self.assertIn("-c:a aac", encoding)
+        self.assertIn("-f mp4", encoding)
+        for flag in ("--embed-metadata", "--write-thumbnail", "--write-subs", "--force-keyframes-at-cuts"):
+            self.assertIn(flag, cmd)
+        name = cmd[cmd.index("-o") + 1]
+        self.assertIn("clip 60.125-90.5", name)
+        other = server.download_command("https://youtu.be/x", {**opts, "end_time": "91"}, TMP, TMP / "done")
+        self.assertNotEqual(name, other[other.index("-o") + 1])
+        exact = server.download_command("https://youtu.be/x", {**opts, "format_id": "137+140"}, TMP, TMP / "done")
+        self.assertEqual(exact[exact.index("-f") + 1], "137+140")
+
+    def test_audio_clips_keep_conversion_without_video_encoding(self):
+        for fmt in server.AUDIO_FORMATS:
+            cmd = server.download_command("https://youtu.be/x", {
+                "mode": "audio", "audio_format": fmt, "start_time": "2"}, TMP, TMP / "done")
+            self.assertEqual(cmd[cmd.index("--download-sections") + 1], "*2-inf")
+            self.assertEqual(cmd[cmd.index("--audio-format") + 1], fmt)
+            self.assertIn("--force-keyframes-at-cuts", cmd)
+            self.assertIn("-vn", cmd[cmd.index("--downloader-args") + 1])
+
+
+class ClipRequests(ServerTest):
+    def test_bad_ranges_are_rejected_before_probing_or_starting_jobs(self):
+        with mock.patch.object(server, "probe", side_effect=AssertionError("probe called")), \
+                mock.patch.object(server, "download_worker") as worker:
+            status, _ = self.client.post("/api/download", {"url": "https://youtu.be/x",
+                                                         "start_time": "20", "end_time": "10"})
+        self.assertEqual(status, 400)
+        worker.assert_not_called()
+        self.assertEqual(server.JOBS, {})
+
+    def test_duration_live_and_missing_ffmpeg_checks(self):
+        for info, opts in (({"duration": 60}, {"start_time": "60"}),
+                           ({"duration": 60}, {"end_time": "61"}),
+                           ({"is_live": True}, {"end_time": "10"})):
+            with mock.patch.object(server, "FFMPEG", "ffmpeg"), \
+                    mock.patch.object(server, "probe", return_value=info), \
+                    mock.patch.object(server, "download_worker") as worker:
+                status, _ = self.client.post("/api/download", {"url": "https://youtu.be/x", **opts})
+            self.assertEqual(status, 400)
+            worker.assert_not_called()
+        with mock.patch.object(server, "FFMPEG", None), mock.patch.object(server, "probe") as probe:
+            status, body = self.client.post("/api/download", {"url": "https://youtu.be/x", "end_time": "10"})
+        self.assertEqual(status, 400)
+        self.assertIn("ffmpeg", body["error"])
+        probe.assert_not_called()
+
+    def test_clip_is_recorded_in_job_state(self):
+        with mock.patch.object(server, "FFMPEG", "ffmpeg"), \
+                mock.patch.object(server, "probe", return_value={"duration": 60}), \
+                mock.patch.object(server, "download_worker") as worker:
+            status, body = self.client.post("/api/download", {"url": "https://youtu.be/x",
+                                                            "start_time": "10.5", "end_time": "60"})
+        self.assertEqual(status, 200, body)
+        _, state = self.client.get("/api/state")
+        self.assertEqual(state["jobs"][0]["clip"], {"start": 10.5, "end": 60})
+        self.assertEqual(worker.call_args.args[2]["end_time"], 60)
 
 
 class DownloadFolder(ServerTest):

@@ -267,6 +267,25 @@
 
     <div id="codecWarn" class="warnbox" hidden></div>
 
+    <div style="margin-top:14px">
+      <div class="grid">
+        <div>
+          <label for="clipStart">Start time (optional)</label>
+          <input type="text" id="clipStart" placeholder="Beginning of video" maxlength="32"
+                 autocomplete="off" spellcheck="false" aria-describedby="clipHint clipErr">
+        </div>
+        <div>
+          <label for="clipEnd">End time (optional)</label>
+          <input type="text" id="clipEnd" placeholder="End of video" maxlength="32"
+                 autocomplete="off" spellcheck="false" aria-describedby="clipHint clipErr">
+        </div>
+      </div>
+      <div class="hint" id="clipHint">Leave both blank for the whole video. Use seconds, M:SS or H:MM:SS, with optional milliseconds (e.g. 1:23.500). Video clips are re-encoded for clean cuts using your codec and container choices.</div>
+      <div class="hint" id="clipSummary" aria-live="polite"></div>
+      <div class="err-text" id="clipErr" role="alert" hidden></div>
+      <button class="small" id="clipReset" style="margin-top:8px" hidden>Use whole video</button>
+    </div>
+
     <div class="checks">
       <label><input type="checkbox" id="optMeta" checked> Metadata</label>
       <label><input type="checkbox" id="optThumb"> Thumbnail file</label>
@@ -314,6 +333,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let probed = null;
+let probedUrl = "";
 let pickedFormat = "";
 let preset = "edit";
 
@@ -333,6 +353,76 @@ function clock(sec) {
   const m = Math.floor(sec / 60), s = sec % 60;
   return m + ":" + String(s).padStart(2, "0");
 }
+
+function clipClock(sec) {
+  const millis = Math.round(sec * 1000);
+  const h = Math.floor(millis / 3600000);
+  const m = Math.floor(millis / 60000) % 60;
+  const s = Math.floor(millis / 1000) % 60;
+  const fraction = millis % 1000;
+  return (h ? h + ":" + String(m).padStart(2, "0") : String(Math.floor(millis / 60000)))
+    + ":" + String(s).padStart(2, "0")
+    + (fraction ? "." + String(fraction).padStart(3, "0").replace(/0+$/, "") : "");
+}
+
+function parseTimestamp(value, label) {
+  const text = value.trim();
+  if (!text) return null;
+  const parts = text.split(":");
+  if (text.length > 32 || parts.length > 3 || !/^[0-9]+(?:\.[0-9]{1,3})?$/.test(parts.at(-1))
+      || parts.slice(0, -1).some(p => !/^[0-9]+$/.test(p)))
+    throw new Error("Invalid " + label + " time; use seconds, M:SS or H:MM:SS.");
+  if (parts.length > 1 && Number(parts.at(-1)) >= 60
+      || parts.length === 3 && Number(parts[1]) >= 60)
+    throw new Error("Invalid " + label + " time; minutes and seconds after a colon must be less than 60.");
+  const seconds = parts.reduce((total, part) => total * 60 + Number(part), 0);
+  if (!Number.isFinite(seconds) || seconds > 999999999) throw new Error("Invalid " + label + " time.");
+  return seconds;
+}
+
+function readClipRange() {
+  const start = parseTimestamp($("clipStart").value, "start");
+  const end = parseTimestamp($("clipEnd").value, "end");
+  if (start === null && end === null) return null;
+  if (end !== null && end <= (start || 0)) throw new Error("End time must be greater than start time.");
+  const info = probedUrl === $("url").value.trim() ? probed : null;
+  if (info?.is_live) throw new Error("Time ranges are only supported for recorded videos.");
+  if (Number.isFinite(info?.duration) && info.duration > 0) {
+    if ((start || 0) >= info.duration) throw new Error("Start time must be before the end of the video.");
+    if (end !== null && end > info.duration) throw new Error("End time exceeds the video duration.");
+  }
+  return { start: start || 0, end };
+}
+
+function updateClipRange() {
+  $("clipReset").hidden = !($("clipStart").value || $("clipEnd").value);
+  $("clipErr").hidden = true;
+  $("clipStart").removeAttribute("aria-invalid");
+  $("clipEnd").removeAttribute("aria-invalid");
+  try {
+    const range = readClipRange();
+    $("clipSummary").textContent = range
+      ? "Clip: " + clipClock(range.start) + " – " + (range.end === null ? "end" : clipClock(range.end))
+        + (range.end === null ? "" : " · " + clipClock(range.end - range.start) + " long")
+        + ($("optSubs").checked ? " · Subtitle files keep the original video's timestamps." : "")
+      : "Whole video";
+    return true;
+  } catch (e) {
+    $("clipSummary").textContent = "";
+    $("clipErr").textContent = e.message;
+    $("clipErr").hidden = false;
+    $("clipStart").setAttribute("aria-invalid", "true");
+    $("clipEnd").setAttribute("aria-invalid", "true");
+    return false;
+  }
+}
+
+["clipStart", "clipEnd"].forEach(id => $(id).addEventListener("input", updateClipRange));
+$("optSubs").addEventListener("change", updateClipRange);
+$("clipReset").addEventListener("click", () => {
+  $("clipStart").value = $("clipEnd").value = "";
+  updateClipRange();
+});
 
 async function api(path, body) {
   const opts = body
@@ -404,24 +494,41 @@ function checkCombo() {
 
 $("probeBtn").addEventListener("click", doProbe);
 $("url").addEventListener("keydown", e => { if (e.key === "Enter") doProbe(); });
+$("url").addEventListener("input", () => {
+  if ($("url").value.trim() !== probedUrl) {
+    probed = null;
+    pickedFormat = "";
+    $("fmtPicked").hidden = true;
+    $("infoCard").hidden = true;
+    $("fmtTable").querySelector("tbody").innerHTML = "";
+  }
+  updateClipRange();
+});
 
 async function doProbe() {
   const url = $("url").value.trim();
   if (!url) return;
 
   const btn = $("probeBtn");
+  if (btn.disabled) return;
   btn.disabled = true;
   btn.innerHTML = '<span class="spin">◐</span>';
   $("probeErr").hidden = true;
 
   try {
-    probed = await api("/api/probe", { url });
+    const info = await api("/api/probe", { url });
+    if ($("url").value.trim() !== url) return;
+    probed = info;
+    probedUrl = url;
     renderInfo(probed);
+    updateClipRange();
   } catch (e) {
+    if ($("url").value.trim() !== url) return;
     probed = null;
     $("infoCard").hidden = true;
     $("probeErr").hidden = false;
     $("probeErr").textContent = e.message;
+    updateClipRange();
   } finally {
     btn.disabled = false;
     btn.textContent = "Check";
@@ -491,7 +598,7 @@ function renderInfo(info) {
       pickedFormat = pickedFormat === f.format_id ? "" : f.format_id;
       $("fmtPicked").hidden = !pickedFormat;
       $("fmtPicked").textContent = pickedFormat
-        ? "Format " + pickedFormat + " selected — the options above are ignored. Click again to clear."
+        ? "Source format " + pickedFormat + " selected — quality and source codec selection are overridden. Clip encoding, output format and extras still apply. Click again to clear."
         : "";
     });
     td.appendChild(pick);
@@ -505,6 +612,7 @@ function renderInfo(info) {
 $("dlBtn").addEventListener("click", async () => {
   const url = $("url").value.trim();
   if (!url) { $("url").focus(); return; }
+  if (!updateClipRange()) { $("clipStart").focus(); return; }
 
   const body = {
     url,
@@ -519,6 +627,8 @@ $("dlBtn").addEventListener("click", async () => {
     metadata: $("optMeta").checked,
     thumbnail: $("optThumb").checked,
     subtitles: $("optSubs").checked,
+    start_time: $("clipStart").value.trim(),
+    end_time: $("clipEnd").value.trim(),
   };
 
   const btn = $("dlBtn");
@@ -635,7 +745,8 @@ function resultBlock(j) {
 
 function updateJob(node, j) {
   node.name.textContent = j.file || j.title;
-  node.stage.textContent = j.stage || "";
+  node.stage.textContent = (j.stage || "") + (j.clip
+    ? " · " + clipClock(j.clip.start) + " – " + (j.clip.end === null ? "end" : clipClock(j.clip.end)) : "");
 
   if (j.status === "running") {
     const speed = j.speed ? human(j.speed) + "/s" : "";
@@ -752,6 +863,7 @@ $("folderAuto").addEventListener("click", () => changeFolder("/api/folder", { pa
 $("folderBrowse").addEventListener("click", () => changeFolder("/api/pick-folder", {}, $("folderBrowse")));
 
 applyPreset("edit");
+updateClipRange();
 loadConfig();
 refresh();
 setInterval(refresh, 1000);

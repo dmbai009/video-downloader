@@ -61,10 +61,36 @@ Stop with `Ctrl+C`.
 2. Pick a preset, or set quality, video codec, audio codec and container by hand.
    The **Pick an exact format** section exposes every individual format ID if you
    want one specific stream.
-3. Press **Download**. Progress, speed and ETA appear below.
+3. Optionally enter **Start time** and/or **End time** to download a clip.
+4. Press **Download**. Progress appears below.
 
 That is the whole download. The file is written straight to the download folder on the
 machine running the server — nothing else is needed.
+
+## Video and audio clips
+
+Leave both time fields blank to download the whole video. Enter seconds (`83.5`),
+minutes and seconds (`1:23.500`), or hours, minutes and seconds (`0:01:23.500`).
+Up to three decimal places are supported. A blank start means the beginning;
+a blank end means the end of the video. **Use whole video** clears both fields.
+
+The page shows the selected interval and its length. The server checks the real
+video duration even when you skip **Check**, and rejects reversed or empty ranges,
+times outside the video and live streams. A range needs ffmpeg.
+
+All presets and output choices apply to clips: **For editing** produces H.264/AAC
+in MP4, **Best quality** uses the selected source quality and outputs MKV, and
+**Audio only** exports the interval in the chosen audio format. Exact format IDs
+choose the source stream; clip encoding and output settings still apply.
+
+Clips are re-encoded for clean cuts, so they can take longer and their file size
+and codecs may differ from the source. With **Any** codecs, clips use H.264/AAC
+(VP9/Opus for WebM). Video encoding uses CRF 18; this is not lossless. Whole-video
+downloads keep their existing behavior. Different intervals have separate filenames
+containing the range, and the interval is also shown in the download list.
+
+Metadata and thumbnail options still apply. Downloaded subtitle files retain the
+original video's timestamps; they are not trimmed or shifted to the clip.
 
 ## Download folder
 
@@ -151,7 +177,10 @@ Cookies expire. When downloads start failing with a login error, export a fresh 
 
 ## Notes
 
-- **Tests:** `python -m unittest discover -s tests -v` (no network or yt-dlp runs).
+- **Tests:** `python -m unittest discover -s tests -v`. Unit tests use mocks;
+  optional media tests run local yt-dlp/ffmpeg/ffprobe against a synthetic video
+  served on loopback, without accessing YouTube or Niconico. UI checks:
+  `node tests/test_ui.js`.
 - **Playlists are disabled** (`--no-playlist`): a link to a video inside a playlist
   downloads that one video, not the whole list.
 - **MKV does not preview.** Browsers cannot play the Matroska container, so the

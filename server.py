@@ -9,6 +9,7 @@ only the yt-dlp and ffmpeg executables.
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -44,7 +45,7 @@ DEFAULT_CONFIG = {
     "ffmpeg": "",
 }
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_JSON_BODY = 64 * 1024
 MAX_ACTIVE_DOWNLOADS = 3
 MAX_CONCURRENT_PROBES = 2
@@ -322,6 +323,48 @@ URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
 CONTAINERS = ("mp4", "mkv", "webm")
 AUDIO_FORMATS = ("m4a", "mp3", "opus", "wav", "flac")
 FORMAT_ID_RE = re.compile(r"^[\w.+\-]{0,100}$")
+TIMESTAMP_RE = re.compile(r"[0-9]+(?:\.[0-9]{1,3})?")
+
+
+def parse_timestamp(value, label):
+    """Accept seconds, M:SS or H:MM:SS with optional milliseconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"Invalid {label} time")
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if (len(text) > 32 or len(parts) > 3 or
+            not TIMESTAMP_RE.fullmatch(parts[-1]) or
+            any(not re.fullmatch(r"[0-9]+", part) for part in parts[:-1])):
+        raise ValueError(f"Invalid {label} time; use seconds, M:SS or H:MM:SS")
+    if len(parts) > 1 and float(parts[-1]) >= 60:
+        raise ValueError(f"Invalid {label} time; seconds must be less than 60")
+    if len(parts) == 3 and int(parts[1]) >= 60:
+        raise ValueError(f"Invalid {label} time; minutes must be less than 60")
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + float(part)
+    if not math.isfinite(seconds) or seconds > 999999999:
+        raise ValueError(f"Invalid {label} time")
+    return round(seconds, 3)
+
+
+def clip_range(opts):
+    start = parse_timestamp(opts.get("start_time"), "start")
+    end = parse_timestamp(opts.get("end_time"), "end")
+    if start is None and end is None:
+        return None
+    start = start or 0.0
+    if end is not None and end <= start:
+        raise ValueError("End time must be greater than start time")
+    return start, end
+
+
+def timestamp_arg(seconds):
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
 
 
 def check_url(url):
@@ -349,6 +392,7 @@ def check_options(opts):
         raise ValueError("Invalid audio format")
     if not FORMAT_ID_RE.match(str(opts.get("format_id") or "")):
         raise ValueError("Invalid format id")
+    clip_range(opts)
     return opts
 
 
@@ -430,6 +474,7 @@ def probe(url):
         "title": raw.get("title"),
         "uploader": raw.get("uploader") or raw.get("channel") or raw.get("uploader_id"),
         "duration": raw.get("duration"),
+        "is_live": raw.get("is_live", False),
         "thumbnail": raw.get("thumbnail"),
         "extractor": raw.get("extractor_key"),
         "webpage_url": raw.get("webpage_url") or url,
@@ -454,6 +499,27 @@ PROG_PREFIX = "PROG|"
 def start_job(url, opts):
     check_url(url)
     check_options(opts)
+    opts = dict(opts)
+    section = clip_range(opts)
+    clip_duration = None
+    if section:
+        if not FFMPEG:
+            raise ValueError("ffmpeg is required to download a time range")
+        info = probe(url)
+        if info.get("is_live"):
+            raise ValueError("Time ranges are only supported for recorded videos")
+        start, end = section
+        duration = info.get("duration")
+        if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+            if start >= duration:
+                raise ValueError("Start time must be before the end of the video")
+            if end is not None and end > duration:
+                raise ValueError("End time exceeds the video duration")
+        opts.update(start_time=start, end_time=end)
+        if end is not None:
+            clip_duration = end - start
+        elif isinstance(duration, (int, float)) and math.isfinite(duration) and duration > start:
+            clip_duration = duration - start
     job_id = uuid.uuid4().hex[:12]
     outdir = DOWNLOAD_DIR          # the folder can change while this job runs
     job = {
@@ -471,6 +537,8 @@ def start_job(url, opts):
         "dir": str(outdir),
         "error": None,
         "created": time.time(),
+        "clip": {"start": section[0], "end": section[1]} if section else None,
+        "clip_duration": clip_duration,
     }
     with JOBS_LOCK:
         if sum(j.get("status") == "running" for j in JOBS.values()) >= MAX_ACTIVE_DOWNLOADS:
@@ -489,6 +557,11 @@ def start_job(url, opts):
 
 
 def download_command(url, opts, outdir, donefile):
+    section = clip_range(opts)
+    filename = "%(title)s [%(id)s]"
+    if section:
+        start, end = section
+        filename += f" [clip {timestamp_arg(start)}-{timestamp_arg(end) if end is not None else 'end'}]"
     cmd = base_args() + [
         "--newline",
         "--concurrent-fragments", "4",
@@ -498,8 +571,45 @@ def download_command(url, opts, outdir, donefile):
         "%(progress.speed)s|%(progress.eta)s",
         "--print-to-file", "after_move:filepath", str(donefile),
         "-f", build_selector(opts),
-        "-o", str(outdir / "%(title)s [%(id)s].%(ext)s"),
+        "-o", str(outdir / (filename + ".%(ext)s")),
     ]
+
+    if section:
+        cmd += ["--download-sections", f"*{timestamp_arg(start)}-{timestamp_arg(end) if end is not None else 'inf'}"]
+        cmd += ["--force-keyframes-at-cuts"]
+        if opts.get("mode") == "audio":
+            # Stream copying can seek to an earlier video keyframe when the
+            # source contains both tracks. Decode only audio for precise cuts.
+            audio = {
+                "m4a": "-c:a aac -b:a 192k",
+                "mp3": "-c:a libmp3lame -q:a 2",
+                "opus": "-c:a libopus -b:a 192k",
+                "wav": "-c:a pcm_s16le",
+                "flac": "-c:a flac",
+            }[opts.get("audio_format") or "m4a"]
+            cmd += ["--downloader-args", f"ffmpeg_o:-vn {audio} -f matroska"]
+        else:
+            # Re-encode for clean, frame-accurate cuts. Explicit encoders keep
+            # codec preferences (especially H.264/AAC for editing) intact even
+            # when yt-dlp has to fall back to other source tracks.
+            container = opts.get("container") or "mp4"
+            video = {
+                "h264": "-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p",
+                "vp9": "-c:v libvpx-vp9 -crf 18 -b:v 0",
+                "av1": "-c:v libsvtav1 -crf 18 -preset 6",
+            }.get(opts.get("vcodec"),
+                  "-c:v libvpx-vp9 -crf 18 -b:v 0" if container == "webm" else
+                  "-c:v libx264 -crf 18 -preset medium -pix_fmt yuv420p")
+            audio = {
+                "aac": "-c:a aac -b:a 192k",
+                "opus": "-c:a libopus -b:a 192k",
+            }.get(opts.get("acodec"),
+                  "-c:a libopus -b:a 192k" if container == "webm" else "-c:a aac -b:a 192k")
+            # A single-stream fallback may have another extension. Set the
+            # muxer here; yt-dlp's remux step then gives it the correct suffix.
+            muxer = "matroska" if container == "mkv" else container
+            cmd += ["--downloader-args", f"ffmpeg_o:{video} {audio} -f {muxer}",
+                    "--remux-video", container]
 
     if opts.get("mode") == "audio":
         cmd += ["-x", "--audio-format", opts.get("audio_format") or "m4a"]
@@ -517,6 +627,8 @@ def download_command(url, opts, outdir, donefile):
 
 def download_worker(job_id, url, opts, outdir):
     job = JOBS[job_id]
+    if job.get("clip"):
+        job["stage"] = "Downloading clip" if opts.get("mode") == "audio" else "Downloading and encoding clip"
     # yt-dlp writes the final path here; parsing it out of stdout is far less reliable.
     donefile = JOBDIR / f"{job_id}.txt"
     cmd = download_command(url, opts, outdir, donefile)
@@ -542,6 +654,11 @@ def download_worker(job_id, url, opts, outdir):
         if line:
             tail.append(line)
             del tail[:-40]                      # keep only the last lines for errors
+        if job.get("clip_duration"):
+            progress = re.search(r"\btime=(\d+:\d+:\d+(?:\.\d{1,3})?)", line)
+            if progress:
+                elapsed = parse_timestamp(progress[1], "progress")
+                job["percent"] = round(min(elapsed / job["clip_duration"] * 100, 99), 1)
         if "[Merger]" in line:
             job.update(stage="Merging tracks", percent=99)
         elif "[ExtractAudio]" in line:
@@ -946,6 +1063,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(429, {"error": str(exc)})
             except ValueError as exc:
                 return self._json(400, {"error": str(exc)})
+            except subprocess.TimeoutExpired:
+                return self._json(504, {"error": "yt-dlp did not respond within 3 minutes"})
+            except Exception as exc:
+                return self._json(502, {"error": str(exc)})
 
         if path in ("/api/folder", "/api/pick-folder"):
             if not self._is_local():
